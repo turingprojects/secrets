@@ -1,22 +1,22 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"time"
 
-	"github.com/go-redis/redis/v7"
 	"github.com/jhaals/yopass/pkg/yopass"
+	"github.com/redis/go-redis/v9"
 )
 
 // NewRedis returns a new Redis database client
-func NewRedis(url string) (Database, error) {
+func NewRedis(url string) (*Redis, error) {
 	options, err := redis.ParseURL(url)
 	if err != nil {
-		return nil, err
+		return nil, errors.New("redis: invalid connection URL; check the scheme and percent-encode credentials")
 	}
-	client := redis.NewClient(options)
-	return &Redis{client}, nil
+	return &Redis{redis.NewClient(options)}, nil
 }
 
 // Redis client
@@ -24,49 +24,160 @@ type Redis struct {
 	client *redis.Client
 }
 
-// Get key from Redis
-func (r *Redis) Get(key string) (yopass.Secret, error) {
+// Status returns secret metadata without deleting it (safe for one-time secrets).
+func (r *Redis) Status(key string) (yopass.Secret, error) {
 	var s yopass.Secret
-	v, err := r.client.Get(key).Result()
+	v, err := r.client.Get(context.Background(), key).Result()
+	if err == redis.Nil {
+		return s, ErrKeyNotFound
+	}
 	if err != nil {
 		return s, err
 	}
-
 	if err := json.Unmarshal([]byte(v), &s); err != nil {
 		return s, err
-	}
-
-	if s.OneTime {
-		_, err := r.Delete(key)
-		if err != nil {
-			return s, err
-		}
 	}
 	return s, nil
 }
 
+// Get returns a secret, atomically claiming one-time values before delivery.
+func (r *Redis) Get(key string) (yopass.Secret, error) {
+	return r.GetAuthorized(key, func(yopass.Secret) error { return nil })
+}
+
+// WATCH begins before reading so even an identical-value rewrite invalidates
+// the claim. Authorization and delivery use this same snapshot.
+func (r *Redis) GetAuthorized(key string, authorize func(yopass.Secret) error) (yopass.Secret, error) {
+	return r.readAuthorized(key, authorize, false)
+}
+
+func (r *Redis) DeleteAuthorized(key string, authorize func(yopass.Secret) error) (bool, error) {
+	_, err := r.readAuthorized(key, authorize, true)
+	return err == nil, err
+}
+
+func (r *Redis) readAuthorized(key string, authorize func(yopass.Secret) error, deleteValue bool) (yopass.Secret, error) {
+	ctx := context.Background()
+	var secret yopass.Secret
+	var claimID string
+	err := r.client.Watch(ctx, func(tx *redis.Tx) error {
+		value, err := tx.Get(ctx, key).Result()
+		if err == redis.Nil {
+			return ErrKeyNotFound
+		}
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal([]byte(value), &secret); err != nil {
+			return err
+		}
+		if err := authorize(secret); err != nil {
+			return err
+		}
+		if !secret.OneTime && !deleteValue {
+			return nil
+		}
+		claimID, err = yopass.GenerateID()
+		if err != nil {
+			return err
+		}
+		var deleted *redis.IntCmd
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			deleted = pipe.Del(ctx, key)
+			pipe.Set(ctx, "claim:"+key, claimID, claimRecordTTL*time.Second)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if deleted.Val() != 1 {
+			return ErrKeyNotFound
+		}
+		return nil
+	}, key)
+	if err == redis.TxFailedErr {
+		err = ErrKeyNotFound
+	}
+	if err != nil && err != ErrKeyNotFound && claimID != "" {
+		if owner, readErr := r.client.Get(ctx, "claim:"+key).Result(); readErr == nil && owner == claimID {
+			err = nil
+		}
+	}
+	if err != nil {
+		return yopass.Secret{}, err
+	}
+	return secret, nil
+}
+
 // Put key to Redis
+//
+// The SET runs inside MULTI/EXEC: go-redis sends a plain command again when
+// its reply is late, but never a transaction it has already written. A delayed
+// first SET would otherwise still reach Redis after the key was handed out and
+// claimed, revoked or updated, and restore the original value.
 func (r *Redis) Put(key string, secret yopass.Secret) error {
 	data, err := secret.ToJSON()
 	if err != nil {
 		return err
 	}
-	return r.client.Set(
-		key,
-		data,
-		time.Duration(secret.Expiration)*time.Second,
-	).Err()
+	ctx := context.Background()
+	_, err = r.client.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		pipe.Set(ctx, key, data, time.Duration(secret.Expiration)*time.Second)
+		return nil
+	})
+	return err
+}
+
+// Update atomically applies fn to the value at key using an optimistic
+// WATCH/MULTI/EXEC transaction, retrying on contention.
+func (r *Redis) Update(key string, fn func(yopass.Secret) (yopass.Secret, error)) error {
+	ctx := context.Background()
+	var lastErr error
+	for i := 0; i < updateRetries; i++ {
+		err := r.client.Watch(ctx, func(tx *redis.Tx) error {
+			v, err := tx.Get(ctx, key).Result()
+			if err == redis.Nil {
+				return ErrKeyNotFound
+			}
+			if err != nil {
+				return err
+			}
+			var s yopass.Secret
+			if err := json.Unmarshal([]byte(v), &s); err != nil {
+				return err
+			}
+			updated, err := fn(s)
+			if err != nil {
+				return err
+			}
+			data, err := updated.ToJSON()
+			if err != nil {
+				return err
+			}
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.Set(ctx, key, data, time.Duration(updated.Expiration)*time.Second)
+				return nil
+			})
+			return err
+		}, key)
+		if err != redis.TxFailedErr {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
 }
 
 // Delete key from Redis
 func (r *Redis) Delete(key string) (bool, error) {
-	res, err := r.client.Del(key).Result()
-	if res != 1 {
-		return false, fmt.Errorf("expected to delete 1 key, but deleted %d keys", res)
+	res, err := r.client.Del(context.Background(), key).Result()
+	if err != nil {
+		return false, err
 	}
-	if err == redis.Nil {
-		return false, nil
-	}
+	return res == 1, nil
+}
 
-	return err == nil, err
+// Health checks Redis connectivity using PING command
+func (r *Redis) Health() error {
+	return r.client.Ping(context.Background()).Err()
 }

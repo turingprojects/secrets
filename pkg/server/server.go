@@ -1,262 +1,209 @@
 package server
 
 import (
-	"encoding/json"
 	"net/http"
-	"strconv"
-	"strings"
+	"net/url"
 	"time"
 
-	"github.com/gofrs/uuid"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/jhaals/yopass/pkg/yopass"
+	"github.com/gorilla/securecookie"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/spf13/viper"
+	"github.com/zitadel/oidc/v3/pkg/client/rp"
 	"go.uber.org/zap"
 )
 
 // Server struct holding database and settings.
-// This should be created with server.New
+// All configuration is carried in struct fields so the package can be used
+// as a library without global state; cmd/yopass-server populates them from
+// the CLI flags of the same names.
 type Server struct {
-	DB                  Database
-	MaxLength           int
-	Registry            *prometheus.Registry
-	ForceOneTimeSecrets bool
-	AssetPath           string
-	Logger              *zap.Logger
+	DB                    Database
+	FileStore             FileStore
+	MaxLength             int
+	MaxFileSize           int64
+	Registry              *prometheus.Registry
+	ForceOneTimeSecrets   bool
+	DefaultOneTimeSecrets *bool // nil preserves the default of one-time downloads
+	DefaultReadReceipt    bool
+	AssetPath             string
+	Logger                *zap.Logger
+	TrustedProxies        []string
+	Version               string
+	License               LicenseStatus
+	OIDCProvider          rp.RelyingParty
+	CookieCodec           *securecookie.SecureCookie
+	Audit                 AuditLogger
+
+	// Webhooks, when non-nil, receives secret lifecycle events
+	// (license-gated, configured via --webhook-url).
+	Webhooks *WebhookNotifier
+
+	// FileTransferTimeout is the whole-request deadline used by streaming
+	// uploads and downloads instead of the shorter application-server timeout.
+	FileTransferTimeout time.Duration
+
+	// Feature toggles
+	Argon2                bool
+	ReadOnly              bool
+	DisableUpload         bool
+	PrefetchSecret        bool
+	DisableFeatures       bool
+	DisableOneClickLink   bool
+	NoLanguageSwitcher    bool
+	NoThemeSwitcher       bool
+	DisableSecretRequests bool
+	DisableReadReceipts   bool
+
+	// Authentication
+	AllowUnverifiedEmail bool       // explicit OIDC compatibility opt-out; zero value requires verification
+	RequireAuth          bool       // require authentication to create secrets
+	AllowedEmailDomains  []string   // restrict logins to these email domains
+	APITokens            []APIToken // static bearer tokens for machine-to-machine creation
+
+	// URLs and CORS
+	CORSAllowOrigin  string
+	FrontendURL      string
+	PrivacyNoticeURL string
+	ImprintURL       string
+	PublicURL        string
+	LogoURL          string
+
+	// Branding and theming (license-gated)
+	AppName          string
+	HideAppName      bool
+	ThemeLight       string
+	ThemeDark        string
+	ThemeCustomLight string
+	ThemeCustomDark  string
+
+	// DefaultExpiry is the default secret lifetime.
+	DefaultExpiry string
+
+	// AllowCustomExpiration enables durations within MinExpiration and MaxExpiration.
+	AllowCustomExpiration bool
+	MinExpiration         int32
+	MaxExpiration         int32
+
+	// ForceExpiration, when non-empty, is the server-enforced secret lifetime
+	// as a human-readable duration. Clients may not choose a different value.
+	ForceExpiration string
 }
 
-// createSecret creates secret
-func (y *Server) createSecret(w http.ResponseWriter, request *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", viper.GetString("cors-allow-origin"))
-
-	decoder := json.NewDecoder(request.Body)
-	var s yopass.Secret
-	if err := decoder.Decode(&s); err != nil {
-		y.Logger.Debug("Unable to decode request", zap.Error(err))
-		http.Error(w, `{"message": "Unable to parse json"}`, http.StatusBadRequest)
-		return
+// corsPreflight returns an OPTIONS handler advertising the given methods and
+// request headers.
+func corsPreflight(methods, headers string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Access-Control-Allow-Methods", methods)
+		if headers != "" {
+			w.Header().Set("Access-Control-Allow-Headers", headers)
+		}
 	}
-
-	if !validExpiration(s.Expiration) {
-		http.Error(w, `{"message": "Invalid expiration specified"}`, http.StatusBadRequest)
-		return
-	}
-
-	if !s.OneTime && y.ForceOneTimeSecrets {
-		http.Error(w, `{"message": "Secret must be one time download"}`, http.StatusBadRequest)
-		return
-	}
-
-	if len(s.Message) > y.MaxLength {
-		http.Error(w, `{"message": "The encrypted message is too long"}`, http.StatusBadRequest)
-		return
-	}
-
-	// Generate new UUID
-	uuidVal, err := uuid.NewV4()
-	if err != nil {
-		y.Logger.Error("Unable to generate UUID", zap.Error(err))
-		http.Error(w, `{"message": "Unable to generate UUID"}`, http.StatusInternalServerError)
-		return
-	}
-	key := uuidVal.String()
-
-	// store secret in memcache with specified expiration.
-	if err := y.DB.Put(key, s); err != nil {
-		y.Logger.Error("Unable to store secret", zap.Error(err))
-		http.Error(w, `{"message": "Failed to store secret in database"}`, http.StatusInternalServerError)
-		return
-	}
-
-	resp := map[string]string{"message": key}
-	jsonData, err := json.Marshal(resp)
-	if err != nil {
-		y.Logger.Error("Failed to marshal create secret response", zap.Error(err), zap.String("key", key))
-	}
-
-	if _, err = w.Write(jsonData); err != nil {
-		y.Logger.Error("Failed to write response", zap.Error(err), zap.String("key", key))
-	}
-}
-
-// getSecret from database
-func (y *Server) getSecret(w http.ResponseWriter, request *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", viper.GetString("cors-allow-origin"))
-	w.Header().Set("Cache-Control", "private, no-cache")
-
-	secretKey := mux.Vars(request)["key"]
-	secret, err := y.DB.Get(secretKey)
-	if err != nil {
-		y.Logger.Debug("Secret not found", zap.Error(err), zap.String("key", secretKey))
-		http.Error(w, `{"message": "Secret not found"}`, http.StatusNotFound)
-		return
-	}
-
-	data, err := secret.ToJSON()
-	if err != nil {
-		y.Logger.Error("Failed to encode request", zap.Error(err), zap.String("key", secretKey))
-		http.Error(w, `{"message": "Failed to encode secret"}`, http.StatusInternalServerError)
-		return
-	}
-
-	if _, err := w.Write(data); err != nil {
-		y.Logger.Error("Failed to write response", zap.Error(err), zap.String("key", secretKey))
-	}
-}
-
-// deleteSecret from database
-func (y *Server) deleteSecret(w http.ResponseWriter, request *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", viper.GetString("cors-allow-origin"))
-
-	deleted, err := y.DB.Delete(mux.Vars(request)["key"])
-	if err != nil {
-		http.Error(w, `{"message": "Failed to delete secret"}`, http.StatusInternalServerError)
-		return
-	}
-
-	if !deleted {
-		http.Error(w, `{"message": "Secret not found"}`, http.StatusNotFound)
-		return
-	}
-
-	w.WriteHeader(204)
-}
-
-// optionsSecret handle the Options http method by returning the correct CORS headers
-func (y *Server) optionsSecret(w http.ResponseWriter, _ *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", viper.GetString("cors-allow-origin"))
-	w.Header().Set("Access-Control-Allow-Methods", "*")
-	w.Header().Set("Access-Control-Allow-Headers", "content-type")
-}
-
-func (y *Server) configHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", viper.GetString("cors-allow-origin"))
-	w.Header().Set("Access-Control-Allow-Headers", "content-type")
-	w.Header().Set("Content-Type", "application/json")
-
-	config := map[string]bool{
-		"DISABLE_UPLOAD": viper.GetBool("disable-upload"),
-	}
-
-	json.NewEncoder(w).Encode(config)
 }
 
 // HTTPHandler containing all routes
 func (y *Server) HTTPHandler() http.Handler {
+	if y.Audit == nil {
+		y.Audit = NewNoopAuditLogger()
+	}
 	mx := mux.NewRouter()
 	mx.Use(newMetricsMiddleware(y.Registry))
+	mx.Use(y.corsMiddleware)
 
-	mx.HandleFunc("/secret", y.createSecret).Methods(http.MethodPost)
-	mx.HandleFunc("/secret", y.optionsSecret).Methods(http.MethodOptions)
+	secretOptions := corsPreflight("POST, OPTIONS", "Content-Type")
+	requestOptions := corsPreflight("GET, POST, PUT, DELETE, OPTIONS", "Content-Type, "+requestTokenHeader)
+
+	// Only register write endpoints if not in read-only mode
+	if !y.ReadOnly {
+		mx.Handle("/create/secret", y.maybeRequireAuth("secret.created", y.createSecret)).Methods(http.MethodPost)
+		mx.HandleFunc("/create/secret", secretOptions).Methods(http.MethodOptions)
+	}
+
+	// Secret request endpoints — business feature, requires a valid license.
+	// Note the asymmetry on /request/{id}/secret: POST is the *responder*
+	// fulfilling the request with an encrypted secret, GET is the *requester*
+	// retrieving it (authorized by the management token header).
+	// If the license expires, including before startup, createSecretRequest rejects new
+	// requests per request, while the remaining endpoints stay functional so
+	// already-issued requests can drain within their configured TTLs
+	// instead of stranding their participants.
+	if y.secretRequestRoutesEnabled() {
+		mx.Handle("/request", y.maybeRequireAuth("request.created", y.createSecretRequest)).Methods(http.MethodPost)
+		mx.HandleFunc("/request", requestOptions).Methods(http.MethodOptions)
+		mx.HandleFunc("/request/"+keyParameter, y.getSecretRequest).Methods(http.MethodGet)
+		mx.HandleFunc("/request/"+keyParameter, y.revokeSecretRequest).Methods(http.MethodDelete)
+		mx.HandleFunc("/request/"+keyParameter, requestOptions).Methods(http.MethodOptions)
+		mx.HandleFunc("/request/"+keyParameter+"/secret", y.fulfillSecretRequest).Methods(http.MethodPost)
+		mx.HandleFunc("/request/"+keyParameter+"/secret", y.fetchRequestSecret).Methods(http.MethodGet)
+		mx.HandleFunc("/request/"+keyParameter+"/secret", requestOptions).Methods(http.MethodOptions)
+		mx.HandleFunc("/request/"+keyParameter+"/key", y.rotateRequestKey).Methods(http.MethodPut)
+		mx.HandleFunc("/request/"+keyParameter+"/key", requestOptions).Methods(http.MethodOptions)
+	}
+
+	// Read endpoints - always available
+	if y.PrefetchSecret {
+		mx.HandleFunc("/secret/"+keyParameter+"/status", y.secretStatusHandler("", "secret.status_checked")).Methods(http.MethodGet)
+	}
 	mx.HandleFunc("/secret/"+keyParameter, y.getSecret).Methods(http.MethodGet)
-	mx.HandleFunc("/secret/"+keyParameter, y.deleteSecret).Methods(http.MethodDelete)
+	mx.HandleFunc("/secret/"+keyParameter, y.deleteSecretHandler("", "secret.deleted", false)).Methods(http.MethodDelete)
+
+	// Read receipt status — registered unconditionally so receipts created on
+	// a licensed write instance stay checkable through read-only replicas;
+	// without receipts the endpoints simply return 404. Receipts are keyed by
+	// the raw ID, so the /secret and /file routes share one handler.
+	receiptOptions := corsPreflight("GET, OPTIONS", "Content-Type, "+receiptTokenHeader)
+	mx.HandleFunc("/secret/"+keyParameter+"/receipt", y.getSecretReceipt).Methods(http.MethodGet)
+	mx.HandleFunc("/secret/"+keyParameter+"/receipt", receiptOptions).Methods(http.MethodOptions)
+	mx.HandleFunc("/file/"+keyParameter+"/receipt", y.getSecretReceipt).Methods(http.MethodGet)
+	mx.HandleFunc("/file/"+keyParameter+"/receipt", receiptOptions).Methods(http.MethodOptions)
 
 	mx.HandleFunc("/config", y.configHandler).Methods(http.MethodGet)
-	mx.HandleFunc("/config", y.optionsSecret).Methods(http.MethodOptions)
+	mx.HandleFunc("/config", corsPreflight("GET, OPTIONS", "")).Methods(http.MethodOptions)
 
-	if !viper.GetBool("DISABLE_UPLOAD") {
-		mx.HandleFunc("/file", y.createSecret).Methods(http.MethodPost)
-		mx.HandleFunc("/file", y.optionsSecret).Methods(http.MethodOptions)
-		mx.HandleFunc("/file/"+keyParameter, y.getSecret).Methods(http.MethodGet)
-		mx.HandleFunc("/file/"+keyParameter, y.deleteSecret).Methods(http.MethodDelete)
+	// OIDC authentication routes — only registered when OIDC is configured
+	if y.oidcEnabled() {
+		mx.HandleFunc("/auth/login", y.oidcLoginHandler).Methods(http.MethodGet)
+		mx.HandleFunc("/auth/callback", y.oidcCallbackHandler).Methods(http.MethodGet)
+		mx.HandleFunc("/auth/logout", y.oidcLogoutHandler).Methods(http.MethodPost)
+		mx.HandleFunc("/auth/me", y.oidcMeHandler).Methods(http.MethodGet)
 	}
 
-	mx.PathPrefix("/").Handler(http.FileServer(http.Dir(y.AssetPath)))
-	return handlers.CustomLoggingHandler(nil, SecurityHeadersHandler(mx), httpLogFormatter(y.Logger))
-}
-
-const keyParameter = "{key:(?:[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})}"
-
-// validExpiration validates that expiration is either
-// 3600(1hour), 86400(1day) or 604800(1week)
-func validExpiration(expiration int32) bool {
-	for _, ttl := range []int32{3600, 86400, 604800} {
-		if ttl == expiration {
-			return true
+	// File upload/download endpoints
+	if y.FileStore == nil && !y.DisableUpload {
+		y.FileStore = NewDatabaseFileStore(y.DB)
+	}
+	if !y.ReadOnly && !y.DisableUpload {
+		mx.Handle("/create/file", y.maybeRequireAuth("file.uploaded", y.streamUpload)).Methods(http.MethodPost)
+		mx.HandleFunc("/create/file", y.streamOptions).Methods(http.MethodOptions)
+	}
+	if !y.DisableUpload {
+		mx.HandleFunc("/file/"+keyParameter, y.streamDownload).Methods(http.MethodGet)
+		mx.HandleFunc("/file/"+keyParameter, y.streamOptions).Methods(http.MethodOptions)
+		mx.HandleFunc("/file/"+keyParameter, y.deleteSecretHandler(streamKeyPrefix, "file.deleted", true)).Methods(http.MethodDelete)
+		if y.PrefetchSecret {
+			mx.HandleFunc("/file/"+keyParameter+"/status", y.secretStatusHandler(streamKeyPrefix, "file.status_checked")).Methods(http.MethodGet)
 		}
 	}
-	return false
-}
 
-// SecurityHeadersHandler returns a middleware which sets common security
-// HTTP headers on the response to mitigate common web vulnerabilities.
-func SecurityHeadersHandler(next http.Handler) http.Handler {
-	csp := []string{
-		"default-src 'self'",
-		"font-src 'self' data:",
-		"form-action 'self'",
-		"frame-ancestors 'none'",
-		"script-src 'self'",
-		"style-src 'self' 'unsafe-inline'",
+	mx.HandleFunc("/health", y.healthHandler).Methods(http.MethodGet, http.MethodHead)
+	mx.HandleFunc("/ready", y.readyHandler).Methods(http.MethodGet, http.MethodHead)
+	mx.HandleFunc("/version", y.versionHandler).Methods(http.MethodGet)
+	mx.HandleFunc("/logo", y.logoHandler).Methods(http.MethodGet)
+
+	// http.Dir("") serves the process working directory, not an empty asset set.
+	static := http.NotFoundHandler()
+	if y.AssetPath != "" {
+		static = http.FileServer(http.Dir(y.AssetPath))
 	}
+	mx.PathPrefix("/").Handler(static)
 
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("content-security-policy", strings.Join(csp, "; "))
-		w.Header().Set("referrer-policy", "no-referrer")
-		w.Header().Set("x-content-type-options", "nosniff")
-		w.Header().Set("x-frame-options", "DENY")
-		w.Header().Set("x-xss-protection", "1; mode=block")
-		if r.URL.Scheme == "https" || r.Header.Get("X-Forwarded-Proto") == "https" {
-			w.Header().Set("strict-transport-security", "max-age=31536000")
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
-// newMetricsHandler creates a middleware handler recording all HTTP requests in
-// the given Prometheus registry
-func newMetricsMiddleware(reg prometheus.Registerer) func(http.Handler) http.Handler {
-	requests := prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "yopass_http_requests_total",
-			Help: "Total number of requests served by HTTP method, path and response code.",
-		},
-		[]string{"method", "path", "code"},
-	)
-	reg.MustRegister(requests)
-
-	duration := prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Name:    "yopass_http_request_duration_seconds",
-			Help:    "Histogram of HTTP request latencies by method and path.",
-			Buckets: prometheus.DefBuckets,
-		},
-		[]string{"method", "path"},
-	)
-	reg.MustRegister(duration)
-
-	return func(handler http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			rec := statusCodeRecorder{ResponseWriter: w, statusCode: http.StatusOK}
-			handler.ServeHTTP(&rec, r)
-			path := normalizedPath(r)
-			requests.WithLabelValues(r.Method, path, strconv.Itoa(rec.statusCode)).Inc()
-			duration.WithLabelValues(r.Method, path).Observe(time.Since(start).Seconds())
-		})
-	}
-}
-
-// normlizedPath returns a normalized mux path template representation
-func normalizedPath(r *http.Request) string {
-	if route := mux.CurrentRoute(r); route != nil {
-		if tmpl, err := route.GetPathTemplate(); err == nil {
-			return strings.ReplaceAll(tmpl, keyParameter, ":key")
+	var extraImgSrc []string
+	if y.LogoURL != "" {
+		if u, err := url.Parse(y.LogoURL); err == nil && u.IsAbs() && u.Host != "" {
+			extraImgSrc = []string{u.Scheme + "://" + u.Host}
 		}
 	}
-	return "<other>"
+	return handlers.CustomLoggingHandler(nil, SecurityHeadersHandler(extraImgSrc, y.Argon2, mx), y.httpLogFormatter(mx))
 }
 
-// statusCodeRecorder is a HTTP ResponseWriter recording the response code
-type statusCodeRecorder struct {
-	http.ResponseWriter
-	statusCode int
-}
-
-// WriteHeader implements http.ResponseWriter
-func (rw *statusCodeRecorder) WriteHeader(code int) {
-	rw.ResponseWriter.WriteHeader(code)
-	rw.statusCode = code
-}
+const keyParameter = "{key:(?:[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}|[a-zA-Z0-9]{22})}"

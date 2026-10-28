@@ -1,0 +1,263 @@
+---
+title: Server Options
+sidebar_position: 10
+description: Complete reference for all yopass-server CLI flags and environment variables.
+---
+
+# Server Options
+
+Complete reference for `yopass-server`. All flags can also be set via environment variable.
+
+## Configuration methods
+
+**Flags** take precedence. **Environment variables** are the flag name uppercased with dashes replaced by underscores (e.g. `--max-length` → `MAX_LENGTH`).
+
+---
+
+## Core
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--address` | `ADDRESS` | `0.0.0.0` | Listen address |
+| `--port` | `PORT` | `1337` | Listen port |
+| `--log-level` | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
+| `--metrics-port` | `METRICS_PORT` | `-1` | Port for the Prometheus metrics server. Disabled when `-1` |
+| `--health-check` | `HEALTH_CHECK` | `false` | Check database connectivity and exit |
+| `--asset-path` | `ASSET_PATH` | `public` | Path to the built frontend assets directory |
+
+---
+
+## Database
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--database` | `DATABASE` | `memcached` | Storage backend: `memcached` or `redis` |
+| `--memcached` | `MEMCACHED` | `localhost:11211` | Memcached address (`host:port`) |
+| `--redis` | `REDIS` | `redis://localhost:6379/0` | Redis connection URL |
+
+---
+
+## Secrets
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--max-length` | `MAX_LENGTH` | `10000` | Maximum encrypted secret size in bytes |
+| `--allow-custom-expiration` | `ALLOW_CUSTOM_EXPIRATION` | `false` | Allow custom expiration for secrets, uploads, and secret requests; available without a license |
+| `--min-expiration` | `MIN_EXPIRATION` | `1m` | Inclusive minimum custom duration |
+| `--max-expiration` | `MAX_EXPIRATION` | `90d` | Inclusive maximum custom duration |
+| `--default-expiry` | `DEFAULT_EXPIRY` | `1h` | Default expiration pre-selected in the UI: `1h`, `1d`, or `1w`; custom durations are accepted when enabled |
+| `--force-expiration` | `FORCE_EXPIRATION` | — | Force secrets, file uploads, and secret requests to a fixed expiration: `1h`, `1d`, or `1w`, or a custom duration when enabled. The server rejects any create request with a different value (`400 Expiration does not match server policy`). The UI replaces the expiration selector with the fixed duration |
+| `--default-onetime-secrets` | `DEFAULT_ONETIME_SECRETS` | `true` | Check One-time download by default on the text and file forms; users can change it unless `--force-onetime-secrets` is enabled |
+| `--force-onetime-secrets` | `FORCE_ONETIME_SECRETS` | `false` | Reject secrets that are not set to one-time viewing |
+| `--prefetch-secret` | `PREFETCH_SECRET` | `true` | Show a warning that the secret may be one-time use before revealing it |
+| `--argon2` | `ARGON2` | `false` | Use [Argon2id](https://datatracker.ietf.org/doc/rfc9106/) for password key derivation instead of iterated SHA-256. See [Argon2 key derivation](#argon2-key-derivation) |
+
+### Custom expiration
+
+Custom expiration is disabled by default and needs no business license. Enable it with:
+
+```bash
+yopass-server --allow-custom-expiration --min-expiration=1m --max-expiration=90d
+```
+
+Duration flags and the CLI accept positive integer amounts with `s`, `m`, `h`, `d`, and `w` units, including combinations such as `1d12h`. A day is 24 hours and a week is 7 days. Fractions, negative values, zero lifetimes, and integer overflow are rejected. The API continues to accept whole seconds in `expiration` and `X-Yopass-Expiration`.
+
+The web UI offers a date and time picker in the browser’s local time zone. Policies whose minimum and maximum differ by less than one minute use a relative duration selector, keeping those narrow ranges usable during editing. The selected deadline is converted to remaining whole seconds when submitting, including time spent editing or encrypting. The server receives a duration rather than a local date string, and storage deadlines use Unix timestamps, so the server’s time zone does not affect expiration.
+
+File uploads have a timing limitation: the browser calculates the remaining lifetime before sending the encrypted file, but database-backed file data and download metadata start that lifetime after the upload finishes. A slow upload can therefore remain available beyond the selected date/time by approximately the transfer duration. Disk/S3 blob cleanup deadlines and read receipts are set earlier, so their expiration can differ from the download metadata. The server’s upload timeout limits this drift: `--file-transfer-timeout` defaults to `5m` (`0` uses `--request-timeout`). Increasing the timeout permits longer transfers and a larger timing difference.
+
+The default bounds are 1 minute through 90 days, inclusive. Defaults and forced values must fit those bounds; when changing the minimum above one hour, also set a valid `--default-expiry`. Forced expiration takes precedence over user selection. Bounds apply to new creations; existing secrets and requests keep their original deadlines. Disabling the option restores the standard one-hour, one-day, and one-week choices.
+
+Memcached supports longer durations using absolute timestamps, which Yopass converts automatically. Its client uses signed 32-bit timestamps; configurations exceeding that range fail at startup, and writes also check for overflow. Memcached may evict unexpired secrets under memory pressure, and file metadata still depends on the database even when blobs use disk or S3. Expiration is a maximum lifetime, not a guarantee of availability until that date.
+
+### Argon2 key derivation
+
+The `--argon2` flag switches the S2K (string-to-key) function used when encrypting secrets from the default iterated SHA-256 to Argon2id, a memory-hard function that better resists GPU-accelerated brute-force attacks. This mostly matters for user-chosen passwords; auto-generated keys are random and already infeasible to brute-force.
+
+When enabled, the server:
+
+- Exposes `ARGON2: true` in the `/config` endpoint, so the web frontend and the [CLI](./cli) encrypt with Argon2
+
+```bash
+yopass-server --argon2
+
+# or via environment variable
+ARGON2=true yopass-server
+```
+
+Decryption is unaffected by the flag in either direction: the key derivation type is stored inside each PGP message, so secrets created before enabling (or after disabling) the flag keep working.
+
+:::warning CSP and reverse proxies
+
+The server always includes `'wasm-unsafe-eval'` in the Content-Security-Policy so existing Argon2 messages remain decryptable when the encryption flag is disabled or differs between instances. Reverse proxies that **override** the `Content-Security-Policy` header can silently break decryption in the browser. If your proxy (Nginx, Caddy, Apache, …) sets its own CSP, add `'wasm-unsafe-eval'` to `script-src`:
+
+```
+Content-Security-Policy: ... script-src 'self' 'wasm-unsafe-eval'; ...
+```
+
+`'wasm-unsafe-eval'` is a [CSP Level 3](https://www.w3.org/TR/CSP3/) source keyword that only permits WebAssembly compilation — it does **not** enable `eval()` or `Function()`. Proxies that pass backend headers through unchanged need no configuration.
+
+:::
+
+---
+
+## File Storage
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--max-file-size` | `MAX_FILE_SIZE` | `512KB` | Maximum file upload size (e.g. `10KB`, `512KB`, `1MB`). Capped at 1 MB without a license key |
+| `--disable-upload` | `DISABLE_UPLOAD` | `false` | Disable the `/create/file` upload endpoint entirely |
+| `--file-store` | `FILE_STORE` | *(database)* | File storage backend: `disk`, `s3`, or empty to use the database |
+| `--file-store-path` | `FILE_STORE_PATH` | `/tmp/yopass-files` | Base directory for the disk file store |
+| `--file-store-s3-bucket` | `FILE_STORE_S3_BUCKET` | — | S3 bucket name (required for S3 storage) |
+| `--file-store-s3-prefix` | `FILE_STORE_S3_PREFIX` | `yopass/` | Key prefix for objects stored in S3 |
+| `--file-store-s3-endpoint` | `FILE_STORE_S3_ENDPOINT` | — | S3-compatible endpoint URL (e.g. MinIO at `http://minio:9000`) |
+| `--file-store-s3-region` | `FILE_STORE_S3_REGION` | `us-east-1` | S3 region |
+| `--cleanup-interval` | `CLEANUP_INTERVAL` | `60` | How often (seconds) the built-in file cleanup runs |
+| `--disable-file-cleanup` | `DISABLE_FILE_CLEANUP` | `false` | Disable the built-in cleanup goroutine (use when relying on S3 lifecycle rules instead) |
+
+See [File Storage](./file-storage) for backend setup and S3 lifecycle rule examples.
+
+---
+
+## TLS
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--tls-cert` | `TLS_CERT` | — | Path to the TLS certificate file |
+| `--tls-key` | `TLS_KEY` | — | Path to the TLS private key file |
+
+See [TLS / HTTPS](./tls) for built-in TLS setup and reverse proxy examples.
+
+---
+
+## Security & Networking
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--cors-allow-origin` | `CORS_ALLOW_ORIGIN` | `*` | Value for the `Access-Control-Allow-Origin` response header |
+| `--trusted-proxies` | `TRUSTED_PROXIES` | — | Comma-separated IP addresses or CIDR ranges whose `X-Forwarded-For` headers are trusted (e.g. `192.168.1.0/24,10.0.0.0/8`) |
+| `--request-timeout` | `REQUEST_TIMEOUT` | `30s` | Maximum duration for ordinary request reads and response writes. Set to `0` to disable |
+| `--file-transfer-timeout` | `FILE_TRANSFER_TIMEOUT` | `5m` | Maximum duration for streaming file uploads and downloads. Increase for large files; `0` uses `--request-timeout` |
+
+For both timeout flags and their environment variables, include a unit:
+`30s` for 30 seconds, `5m` for 5 minutes, or `1h` for 1 hour. Use `0` without
+a unit for the special behavior described above.
+
+These are whole-request deadlines, not idle timeouts. Keep the backend port
+private and configure the public ingress with its own body/write timeouts and
+per-client and total connection limits. Set both timeout flags to `0` to disable
+the configurable whole-request read/write deadlines; header and idle timeouts
+remain enabled. With built-in TLS, HTTP/2 connections are also closed if they accept no response bytes for 30 seconds while data is waiting to be sent. This progress limit stays active when both timeout flags are `0`; slow connections that keep accepting bytes remain supported.
+
+Application and metrics request headers are limited to 16 KiB, with Go's
+protocol-specific accounting and allowances. This also limits HTTP/2 headers
+after decompression. Oversized headers are rejected before reaching handlers.
+
+---
+
+## Frontend / UI
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--read-only` | `READ_ONLY` | `false` | Disable secret creation endpoints. Retrieval and deletion remain active |
+| `--disable-features` | `DISABLE_FEATURES` | `false` | Hide the features section on the homepage |
+| `--disable-one-click-link` | `DISABLE_ONE_CLICK_LINK` | `false` | Hide the combined link containing the decryption key on text and file result pages. The short link and key remain available to share separately. This controls the UI only; existing combined links still work |
+| `--no-theme-switcher` | `NO_THEME_SWITCHER` | `false` | Hide the theme switcher and always use the light theme, ignoring browser and saved dark-mode preferences |
+| `--no-language-switcher` | `NO_LANGUAGE_SWITCHER` | `false` | Hide the language switcher in the navigation bar |
+| `--privacy-notice-url` | `PRIVACY_NOTICE_URL` | — | URL linked from the privacy notice in the footer |
+| `--imprint-url` | `IMPRINT_URL` | — | URL linked from the imprint / legal notice in the footer |
+| `--public-url` | `PUBLIC_URL` | — | Base URL of the public read-only instance. Secret links generated by the creation instance will use this URL |
+
+See [Read-Only Mode](./read-only-mode) for split-instance deployments.
+
+---
+
+## License
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--license-key` | `LICENSE_KEY` | — | License key that unlocks OIDC authentication, theming, audit logging, and file sizes above 1 MB |
+
+### Expiry behavior
+
+The expiry timestamp is checked continuously at runtime, not just at startup, so a long-running server degrades to the non-business feature set the moment its license expires — no restart needed. The server logs a daily warning during the last 30 days and an error at expiry; the `yopass_license_days_until_expiry` metric counts down live (negative once expired).
+
+When the license expires — whether at runtime or on a restart with an expired key:
+
+- **Disabled**: creating new secret requests, read receipts on new secrets, custom theming/branding/logo, file uploads above the 1 MB cap, audit logging, webhooks, and new OIDC logins.
+- **Kept working, by design**: existing OIDC sessions and `requireAuth` enforcement stay fully active so secrets created with authentication required remain protected *and* accessible to already-authenticated users — an expiring license never weakens access control or strands data. Already-issued secret requests can still be viewed, fulfilled, and retrieved until their original expiration.
+- **Startup without any license key**: the server refuses to start with `--oidc-issuer`, `--audit-log`, or `--webhook-url` configured. This catches misconfiguration — providing these flags without ever having a license is an error, not a degradation.
+
+---
+
+## Authentication *(requires license key)*
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--oidc-issuer` | `OIDC_ISSUER` | — | OIDC provider URL (e.g. `https://accounts.google.com`) |
+| `--oidc-client-id` | `OIDC_CLIENT_ID` | — | OAuth 2.0 client ID |
+| `--oidc-client-secret` | `OIDC_CLIENT_SECRET` | — | OAuth 2.0 client secret |
+| `--oidc-redirect-url` | `OIDC_REDIRECT_URL` | — | Callback URL registered with your OIDC provider (e.g. `https://yopass.example.com/auth/callback`) |
+| `--require-auth` | `REQUIRE_AUTH` | `false` | Require users to be authenticated before they can create secrets |
+| `--api-token` | `API_TOKEN` | — | Static bearer token(s) letting machine clients create secrets when `--require-auth` is set, formatted as `name:secret` (comma-separated for multiple) |
+| `--oidc-allowed-domains` | `OIDC_ALLOWED_DOMAINS` | — | Comma-separated email domains allowed to log in (e.g. `corp.example.com,example.com`) |
+| `--oidc-require-verified-email` | `OIDC_REQUIRE_VERIFIED_EMAIL` | `true` | Require `email_verified: true` for new OIDC logins. Set to `false` only when the provider controls email assertions and application access; domain restrictions still apply. |
+| `--oidc-session-key` | `OIDC_SESSION_KEY` | — | Optional 64-byte hex-encoded session key for sharing sessions across instances; an invalid nonempty key prevents startup. Generate with `openssl rand -hex 64` |
+| `--frontend-url` | `FRONTEND_URL` | — | Frontend base URL for post-login redirect in split-origin (OIDC + separate frontend) deployments |
+
+See [OpenID Connect](./openid-connect) for provider-specific setup and multi-instance configuration.
+
+---
+
+## Branding *(requires license key)*
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--app-name` | `APP_NAME` | — | Custom application name shown in the UI (default: Yopass) |
+| `--hide-app-name` | `HIDE_APP_NAME` | `false` | Hide the application name in the navbar while keeping the logo; does not change the browser tab title |
+| `--logo-url` | `LOGO_URL` | — | URL to a custom logo image (e.g. `/mylogo.svg` for a file in the `public/` directory, or an external CDN URL) |
+| `--theme-light` | `THEME_LIGHT` | `emerald` | DaisyUI theme name for light mode |
+| `--theme-dark` | `THEME_DARK` | `dim` | DaisyUI theme name for dark mode |
+| `--theme-custom-light` | `THEME_CUSTOM_LIGHT` | — | JSON object of CSS variables for a fully custom light theme (keys must start with `--`; only `--color-*` is officially supported, see [theming docs](./theming.md)) |
+| `--theme-custom-dark` | `THEME_CUSTOM_DARK` | — | JSON object of CSS variables for a fully custom dark theme (keys must start with `--`; only `--color-*` is officially supported, see [theming docs](./theming.md)) |
+
+See [Theming & Branding](./theming) for available theme names and CSS variable examples.
+
+---
+
+## Audit Logging *(requires license key)*
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--audit-log` | `AUDIT_LOG` | `false` | Enable structured NDJSON audit logging |
+| `--audit-log-file` | `AUDIT_LOG_FILE` | *(stdout)* | File path for audit log output |
+
+See [Audit Logging](./audit-logging) for log format, event types, and log rotation.
+
+---
+
+## Secret Requests *(requires license key)*
+
+Secret requests are enabled automatically with a valid license key.
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--disable-secret-requests` | `DISABLE_SECRET_REQUESTS` | `false` | Disable the secret request feature |
+
+See [Secret Requests](./secret-requests) for the full flow, security model, and REST API.
+
+---
+
+## Webhooks & Read Receipts *(requires license key)*
+
+Read receipts are enabled automatically with a valid license key; webhooks require a URL.
+
+| Flag | Env var | Default | Description |
+|------|---------|---------|-------------|
+| `--webhook-url` | `WEBHOOK_URL` | — | Endpoint receiving secret and request lifecycle events (created, viewed, fulfilled, expired) |
+| `--webhook-secret` | `WEBHOOK_SECRET` | — | HMAC-SHA256 signing key for webhook payloads |
+| `--default-read-receipt` | `DEFAULT_READ_RECEIPT` | `false` | Check Read receipt by default on the text and file forms when read receipts are enabled; users can uncheck it |
+| `--disable-read-receipts` | `DISABLE_READ_RECEIPTS` | `false` | Disable the read receipt feature |
+
+See [Webhooks](./webhooks) for payload format and signature verification, and [Read Receipts](./read-receipts) for the per-secret "was it opened?" flow.
