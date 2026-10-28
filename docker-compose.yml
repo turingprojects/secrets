@@ -1,6 +1,6 @@
 services:
   redis:
-    image: redis:latest
+    image: redis:7-alpine
     container_name: redis_yopass
     restart: always
     command: redis-server --appendonly yes
@@ -10,27 +10,28 @@ services:
       - yopass-network
 
   yopass:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: turing/yopass
+    # Official image; bump the tag to update (https://hub.docker.com/r/jhaals/yopass/tags)
+    image: jhaals/yopass:16.0.1
     container_name: yopass
     restart: always
     ports:
       - "1337:1337"
     environment:
+      DATABASE: redis
+      REDIS: redis://redis:6379/0
       # Business license (unlocks branding); set it in .env, never in git
-      - LICENSE_KEY=${LICENSE_KEY:?Set LICENSE_KEY in .env}
+      LICENSE_KEY: ${LICENSE_KEY:?Set LICENSE_KEY in .env}
       # Turing Secrets branding
-      - APP_NAME=Turing Secrets
-      - LOGO_URL=/turing-logo.svg
+      APP_NAME: Turing Secrets
+      LOGO_URL: /turing-logo.svg
       # Hide the features cards on the home page
-      - DISABLE_FEATURES=true
+      DISABLE_FEATURES: "true"
       # Default secret lifetime: one week
-      - DEFAULT_EXPIRY=1w
+      DEFAULT_EXPIRY: 1w
+    volumes:
+      - ./website/public/turing-logo.svg:/public/turing-logo.svg:ro
     depends_on:
       - redis
-    command: ["--database", "redis", "--redis", "redis://redis:6379"]
     networks:
       - yopass-network
 
