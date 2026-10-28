@@ -1,24 +1,31 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gorilla/handlers"
+	"github.com/gorilla/mux"
 	"github.com/jhaals/yopass/pkg/yopass"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
-	"github.com/spf13/viper"
 	"go.uber.org/zap/zaptest"
 )
 
 func newTestServer(t *testing.T, db Database, maxLength int, forceOneTime bool) Server {
 	return Server{
 		DB:                  db,
+		FileStore:           NewDatabaseFileStore(db),
 		MaxLength:           maxLength,
 		Registry:            prometheus.NewRegistry(),
 		ForceOneTimeSecrets: forceOneTime,
@@ -26,43 +33,28 @@ func newTestServer(t *testing.T, db Database, maxLength int, forceOneTime bool) 
 	}
 }
 
-type mockDB struct{}
-
-func (db *mockDB) Get(key string) (yopass.Secret, error) {
-	return yopass.Secret{Message: `***ENCRYPTED***`}, nil
-}
-func (db *mockDB) Put(key string, secret yopass.Secret) error {
-	return nil
-}
-func (db *mockDB) Delete(key string) (bool, error) {
-	return true, nil
-}
-
-type brokenDB struct{}
-
-func (db *brokenDB) Get(key string) (yopass.Secret, error) {
-	return yopass.Secret{}, fmt.Errorf("Some error")
-}
-func (db *brokenDB) Put(key string, secret yopass.Secret) error {
-	return fmt.Errorf("Some error")
-}
-func (db *brokenDB) Delete(key string) (bool, error) {
-	return false, fmt.Errorf("Some error")
-}
-
-type mockBrokenDB2 struct{}
-
-func (db *mockBrokenDB2) Get(key string) (yopass.Secret, error) {
-	return yopass.Secret{OneTime: true, Message: "encrypted"}, nil
-}
-func (db *mockBrokenDB2) Put(key string, secret yopass.Secret) error {
-	return fmt.Errorf("Some error")
-}
-func (db *mockBrokenDB2) Delete(key string) (bool, error) {
-	return false, nil
+// armorShaped returns n bytes with armor's 64-character line wrapping: the
+// shape of an armored message, without valid content.
+func armorShaped(n int) string {
+	var b strings.Builder
+	for b.Len() < n {
+		b.WriteString(strings.Repeat("a", 64))
+		b.WriteString("\n")
+	}
+	return b.String()[:n]
 }
 
 func TestCreateSecret(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
 	tt := []struct {
 		name       string
 		statusCode int
@@ -74,45 +66,74 @@ func TestCreateSecret(t *testing.T) {
 		{
 			name:       "validRequest",
 			statusCode: 200,
-			body:       strings.NewReader(`{"message": "hello world", "expiration": 3600}`),
+			body:       strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:     "",
-			db:         &mockDB{},
-			maxLength:  100,
+			db:         newMockDB(),
+			maxLength:  10000,
 		},
 		{
 			name:       "invalid json",
 			statusCode: 400,
 			body:       strings.NewReader(`{fooo`),
 			output:     "Unable to parse json",
-			db:         &mockDB{},
+			db:         newMockDB(),
+		},
+		{
+			name:       "non-PGP message",
+			statusCode: 400,
+			body:       strings.NewReader(`{"expiration": 3600, "message": "hello world"}`),
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+			maxLength:  10000,
 		},
 		{
 			name:       "message too long",
 			statusCode: 400,
-			body:       strings.NewReader(`{"expiration": 3600, "message": "wooop"}`),
+			body:       strings.NewReader(fmt.Sprintf(`{"expiration": 3600, "message": "%s"}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:     "The encrypted message is too long",
-			db:         &mockDB{},
+			db:         newMockDB(),
 			maxLength:  1,
 		},
 		{
 			name:       "invalid expiration",
 			statusCode: 400,
-			body:       strings.NewReader(`{"expiration": 10, "message": "foo"}`),
+			body:       strings.NewReader(fmt.Sprintf(`{"expiration": 10, "message": "%s"}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:     "Invalid expiration specified",
-			db:         &mockDB{},
+			db:         newMockDB(),
+		},
+		{
+			name:       "request body over the transport limit",
+			statusCode: 413,
+			body: strings.NewReader(fmt.Sprintf(`{"expiration": 3600, "message": "%s"}`,
+				strings.Repeat("a", 10*1024))),
+			output:    "Request body too large",
+			db:        newMockDB(),
+			maxLength: 1024,
+		},
+		{
+			// A message of exactly MaxLength is allowed, so the transport cap
+			// must leave room for JSON-escaping armor's line breaks: two bytes
+			// per wrapped line, which outgrows a constant slack.
+			name:       "message at max length reaches validation",
+			statusCode: 400,
+			body: strings.NewReader(fmt.Sprintf(`{"expiration": 3600, "message": "%s"}`,
+				strings.ReplaceAll(armorShaped(1<<20), "\n", "\\n"))),
+			output:    "Message must be PGP encrypted",
+			db:        newMockDB(),
+			maxLength: 1 << 20,
 		},
 		{
 			name:       "broken database",
 			statusCode: 500,
-			body:       strings.NewReader(`{"expiration": 3600, "message": "foo"}`),
+			body:       strings.NewReader(fmt.Sprintf(`{"expiration": 3600, "message": "%s"}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:     "Failed to store secret in database",
-			db:         &brokenDB{},
-			maxLength:  100,
+			db:         newBrokenDB(),
+			maxLength:  10000,
 		},
 	}
 
 	for _, tc := range tt {
-		t.Run(fmt.Sprintf(tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest("POST", "/secret", tc.body)
 			rr := httptest.NewRecorder()
 			y := newTestServer(t, tc.db, tc.maxLength, false)
@@ -132,6 +153,16 @@ func TestCreateSecret(t *testing.T) {
 }
 
 func TestOneTimeEnforcement(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
 	tt := []struct {
 		name           string
 		statusCode     int
@@ -142,37 +173,37 @@ func TestOneTimeEnforcement(t *testing.T) {
 		{
 			name:           "one time request",
 			statusCode:     200,
-			body:           strings.NewReader(`{"message": "hello world", "expiration": 3600, "one_time": true}`),
+			body:           strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600, "one_time": true}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:         "",
 			requireOneTime: true,
 		},
 		{
 			name:           "non oneTime request",
 			statusCode:     400,
-			body:           strings.NewReader(`{"message": "hello world", "expiration": 3600, "one_time": false}`),
+			body:           strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600, "one_time": false}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:         "Secret must be one time download",
 			requireOneTime: true,
 		},
 		{
 			name:           "one_time payload flag missing",
 			statusCode:     400,
-			body:           strings.NewReader(`{"message": "hello world", "expiration": 3600}`),
+			body:           strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:         "Secret must be one time download",
 			requireOneTime: true,
 		},
 		{
 			name:           "one time disabled",
 			statusCode:     200,
-			body:           strings.NewReader(`{"message": "hello world", "expiration": 3600, "one_time": false}`),
+			body:           strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600, "one_time": false}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n"))),
 			output:         "",
 			requireOneTime: false,
 		},
 	}
 	for _, tc := range tt {
-		t.Run(fmt.Sprintf(tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			req, _ := http.NewRequest("POST", "/secret", tc.body)
 			rr := httptest.NewRecorder()
-			y := newTestServer(t, &mockDB{}, 100, tc.requireOneTime)
+			y := newTestServer(t, newMockDB(), 10000, tc.requireOneTime)
 			y.createSecret(rr, req)
 			var s yopass.Secret
 			json.Unmarshal(rr.Body.Bytes(), &s)
@@ -199,18 +230,18 @@ func TestGetSecret(t *testing.T) {
 			name:       "Get Secret",
 			statusCode: 200,
 			output:     "***ENCRYPTED***",
-			db:         &mockDB{},
+			db:         newMockDB(),
 		},
 		{
 			name:       "Secret not found",
 			statusCode: 404,
 			output:     "Secret not found",
-			db:         &brokenDB{},
+			db:         newBrokenDB(),
 		},
 	}
 
 	for _, tc := range tt {
-		t.Run(fmt.Sprintf(tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			req, err := http.NewRequest("GET", "/secret/foo", nil)
 			if err != nil {
 				t.Fatal(err)
@@ -219,8 +250,8 @@ func TestGetSecret(t *testing.T) {
 			y := newTestServer(t, tc.db, 1, false)
 			y.getSecret(rr, req)
 			cacheControl := rr.Header().Get("Cache-Control")
-			if cacheControl != "private, no-cache" {
-				t.Fatalf(`Expected Cache-Control header to be "private, no-cache"; got %s`, cacheControl)
+			if cacheControl != "no-store" {
+				t.Fatalf(`Expected Cache-Control header to be "no-store"; got %s`, cacheControl)
 			}
 			var s yopass.Secret
 			json.Unmarshal(rr.Body.Bytes(), &s)
@@ -244,31 +275,31 @@ func TestDeleteSecret(t *testing.T) {
 		{
 			name:       "Delete Secret",
 			statusCode: 204,
-			db:         &mockDB{},
+			db:         newMockDB(),
 		},
 		{
 			name:       "Secret deletion failed",
 			statusCode: 500,
 			output:     "Failed to delete secret",
-			db:         &brokenDB{},
+			db:         newBrokenDeleteDB(),
 		},
 		{
 			name:       "Secret not found",
 			statusCode: 404,
 			output:     "Secret not found",
-			db:         &mockBrokenDB2{},
+			db:         newMockBrokenDB2(),
 		},
 	}
 
 	for _, tc := range tt {
-		t.Run(fmt.Sprintf(tc.name), func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			req, err := http.NewRequest("DELETE", "/secret/foo", nil)
 			if err != nil {
 				t.Fatal(err)
 			}
 			rr := httptest.NewRecorder()
 			y := newTestServer(t, tc.db, 1, false)
-			y.deleteSecret(rr, req)
+			y.deleteSecretHandler("", "secret.deleted", false)(rr, req)
 			var s struct {
 				Message string `json:"message"`
 			}
@@ -297,7 +328,7 @@ func TestMetrics(t *testing.T) {
 			path:   "/secret/invalid-key-format",
 		},
 	}
-	y := newTestServer(t, &mockDB{}, 1, false)
+	y := newTestServer(t, newMockDB(), 1, false)
 	h := y.HTTPHandler()
 
 	for _, r := range requests {
@@ -338,6 +369,29 @@ yopass_http_requests_total{code="404",method="GET",path="/"} 1
 	}
 }
 
+func TestMetricsMethodCardinality(t *testing.T) {
+	y := newTestServer(t, newMockDB(), 1, false)
+	h := y.HTTPHandler()
+
+	for _, method := range []string{"FOO", "BAR", "BAZ"} {
+		req, err := http.NewRequest(method, "/", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		h.ServeHTTP(httptest.NewRecorder(), req)
+	}
+
+	for _, name := range []string{"yopass_http_requests_total", "yopass_http_request_duration_seconds"} {
+		n, err := testutil.GatherAndCount(y.Registry, name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n != 1 {
+			t.Fatalf(`Expected all unknown methods collapsed into 1 %s series; got %d`, name, n)
+		}
+	}
+}
+
 func TestSecurityHeaders(t *testing.T) {
 	tt := []struct {
 		scheme       string
@@ -347,7 +401,7 @@ func TestSecurityHeaders(t *testing.T) {
 		{
 			scheme: "http",
 			headers: map[string]string{
-				"content-security-policy": "default-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+				"content-security-policy": "default-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'",
 				"referrer-policy":         "no-referrer",
 				"x-content-type-options":  "nosniff",
 				"x-frame-options":         "DENY",
@@ -358,7 +412,7 @@ func TestSecurityHeaders(t *testing.T) {
 		{
 			scheme: "https",
 			headers: map[string]string{
-				"content-security-policy":   "default-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'",
+				"content-security-policy":   "default-src 'self'; font-src 'self' data:; form-action 'self'; frame-ancestors 'none'; img-src 'self' data:; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'",
 				"referrer-policy":           "no-referrer",
 				"strict-transport-security": "max-age=31536000",
 				"x-content-type-options":    "nosniff",
@@ -368,7 +422,7 @@ func TestSecurityHeaders(t *testing.T) {
 		},
 	}
 
-	y := newTestServer(t, &mockDB{}, 1, false)
+	y := newTestServer(t, newMockDB(), 1, false)
 	h := y.HTTPHandler()
 
 	t.Parallel()
@@ -397,10 +451,96 @@ func TestSecurityHeaders(t *testing.T) {
 	}
 }
 
-func TestConfigHandler(t *testing.T) {
-	viper.Set("disable-upload", "true")
+func TestSecurityHeadersArgon2(t *testing.T) {
+	tt := []struct {
+		name          string
+		argon2        bool
+		wantScriptSrc string
+	}{
+		{
+			name:          "argon2 disabled still permits decryption of existing messages",
+			argon2:        false,
+			wantScriptSrc: "script-src 'self' 'wasm-unsafe-eval'",
+		},
+		{
+			name:          "argon2 enabled adds wasm-unsafe-eval to script-src",
+			argon2:        true,
+			wantScriptSrc: "script-src 'self' 'wasm-unsafe-eval'",
+		},
+	}
 
-	server := newTestServer(t, &mockDB{}, 1, false)
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			y := newTestServer(t, newMockDB(), 1, false)
+			y.Argon2 = tc.argon2
+			h := y.HTTPHandler()
+
+			req, err := http.NewRequest("GET", "/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			csp := rr.Header().Get("content-security-policy")
+			if strings.Contains(csp, "'unsafe-eval'") {
+				t.Fatal("WebAssembly support must not permit JavaScript eval")
+			}
+			directives := strings.Split(csp, "; ")
+			if !slices.Contains(directives, tc.wantScriptSrc) {
+				t.Errorf("Expected CSP to contain %q, got %q", tc.wantScriptSrc, csp)
+			}
+		})
+	}
+}
+
+func TestSecurityHeadersExternalLogoURL(t *testing.T) {
+	tt := []struct {
+		name       string
+		logoURL    string
+		wantImgSrc string
+	}{
+		{
+			name:       "external URL adds origin to img-src",
+			logoURL:    "https://cdn.example.com/logo.svg",
+			wantImgSrc: "img-src 'self' data: https://cdn.example.com",
+		},
+		{
+			name:       "relative path does not extend img-src",
+			logoURL:    "/mylogo.png",
+			wantImgSrc: "img-src 'self' data:",
+		},
+		{
+			name:       "no logo-url produces default img-src",
+			logoURL:    "",
+			wantImgSrc: "img-src 'self' data:",
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			y := newTestServer(t, newMockDB(), 1, false)
+			y.LogoURL = tc.logoURL
+			h := y.HTTPHandler()
+
+			req, err := http.NewRequest("GET", "/", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rr := httptest.NewRecorder()
+			h.ServeHTTP(rr, req)
+
+			csp := rr.Header().Get("content-security-policy")
+			if !strings.Contains(csp, tc.wantImgSrc) {
+				t.Errorf("expected CSP to contain %q, got %q", tc.wantImgSrc, csp)
+			}
+		})
+	}
+}
+
+func TestConfigHandler(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.DisableUpload = true
 
 	req := httptest.NewRequest(http.MethodGet, "/config", nil)
 	w := httptest.NewRecorder()
@@ -413,12 +553,1897 @@ func TestConfigHandler(t *testing.T) {
 		t.Fatalf("Expected status OK, got %d", res.StatusCode)
 	}
 
-	var config map[string]bool
+	var config map[string]interface{}
 	if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
 		t.Fatalf("Failed to decode response: %v", err)
 	}
 
-	if got, want := config["DISABLE_UPLOAD"], true; got != want {
+	if got, want := config["DISABLE_UPLOAD"].(bool), true; got != want {
 		t.Errorf("Expected DISABLE_UPLOAD to be %v, got %v", want, got)
+	}
+	if got, want := config["ARGON2"].(bool), false; got != want {
+		t.Errorf("Expected ARGON2 to be %v, got %v", want, got)
+	}
+}
+
+func TestConfigHandlerArgon2(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.Argon2 = true
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	w := httptest.NewRecorder()
+	server.configHandler(w, req)
+
+	res := w.Result()
+	defer res.Body.Close()
+
+	var config map[string]interface{}
+	if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+		t.Fatalf("Failed to decode response: %v", err)
+	}
+	if got, want := config["ARGON2"].(bool), true; got != want {
+		t.Errorf("Expected ARGON2 to be %v, got %v", want, got)
+	}
+}
+
+func TestVersionHandler(t *testing.T) {
+	t.Run("with version set", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.Version = "abc1234"
+
+		req := httptest.NewRequest(http.MethodGet, "/version", nil)
+		w := httptest.NewRecorder()
+		s.versionHandler(w, req)
+
+		res := w.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status OK, got %d", res.StatusCode)
+		}
+		if ct := res.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Expected Content-Type application/json, got %s", ct)
+		}
+
+		var body map[string]string
+		if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+		if got, want := body["version"], "abc1234"; got != want {
+			t.Errorf("Expected version %q, got %q", want, got)
+		}
+	})
+
+	t.Run("without version set", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+
+		req := httptest.NewRequest(http.MethodGet, "/version", nil)
+		w := httptest.NewRecorder()
+		s.versionHandler(w, req)
+
+		res := w.Result()
+		defer res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("Expected status OK, got %d", res.StatusCode)
+		}
+		if ct := res.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("Expected Content-Type application/json, got %s", ct)
+		}
+
+		var body map[string]string
+		if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+			t.Fatalf("Failed to decode response: %v", err)
+		}
+		if got, want := body["version"], "unknown"; got != want {
+			t.Errorf("Expected version %q, got %q", want, got)
+		}
+	})
+}
+
+func TestConfigHandlerLanguageSwitcher(t *testing.T) {
+	tt := []struct {
+		name     string
+		setValue bool
+		expected bool
+	}{
+		{
+			name:     "no-language-switcher disabled (default)",
+			setValue: false,
+			expected: false,
+		},
+		{
+			name:     "no-language-switcher enabled",
+			setValue: true,
+			expected: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, newMockDB(), 1, false)
+			server.NoLanguageSwitcher = tc.setValue
+
+			req := httptest.NewRequest(http.MethodGet, "/config", nil)
+			w := httptest.NewRecorder()
+			server.configHandler(w, req)
+
+			res := w.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Expected status OK, got %d", res.StatusCode)
+			}
+
+			var config map[string]interface{}
+			if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+				t.Fatalf("Failed to decode response: %v", err)
+			}
+
+			if got, want := config["NO_LANGUAGE_SWITCHER"].(bool), tc.expected; got != want {
+				t.Errorf("Expected NO_LANGUAGE_SWITCHER to be %v, got %v", want, got)
+			}
+
+			// Verify the key exists in the response
+			if _, exists := config["NO_LANGUAGE_SWITCHER"]; !exists {
+				t.Error("Expected NO_LANGUAGE_SWITCHER key to exist in config response")
+			}
+		})
+	}
+}
+
+func TestConfigHandlerPrivacyAndImprint(t *testing.T) {
+	tt := []struct {
+		name             string
+		privacyNoticeURL string
+		imprintURL       string
+		expectPrivacy    bool
+		expectImprint    bool
+	}{
+		{
+			name:             "no URLs configured",
+			privacyNoticeURL: "",
+			imprintURL:       "",
+			expectPrivacy:    false,
+			expectImprint:    false,
+		},
+		{
+			name:             "only privacy notice URL configured",
+			privacyNoticeURL: "https://example.com/privacy",
+			imprintURL:       "",
+			expectPrivacy:    true,
+			expectImprint:    false,
+		},
+		{
+			name:             "only imprint URL configured",
+			privacyNoticeURL: "",
+			imprintURL:       "https://example.com/imprint",
+			expectPrivacy:    false,
+			expectImprint:    true,
+		},
+		{
+			name:             "both URLs configured",
+			privacyNoticeURL: "https://example.com/privacy",
+			imprintURL:       "https://example.com/imprint",
+			expectPrivacy:    true,
+			expectImprint:    true,
+		},
+		{
+			name:             "empty string URLs (should not appear in config)",
+			privacyNoticeURL: "",
+			imprintURL:       "",
+			expectPrivacy:    false,
+			expectImprint:    false,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, newMockDB(), 1, false)
+			server.PrivacyNoticeURL = tc.privacyNoticeURL
+			server.ImprintURL = tc.imprintURL
+
+			req := httptest.NewRequest(http.MethodGet, "/config", nil)
+			w := httptest.NewRecorder()
+			server.configHandler(w, req)
+
+			res := w.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Expected status OK, got %d", res.StatusCode)
+			}
+
+			var config map[string]interface{}
+			if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+				t.Fatalf("Failed to decode response: %v", err)
+			}
+
+			// Check privacy notice URL
+			privacyURL, hasPrivacy := config["PRIVACY_NOTICE_URL"]
+			if tc.expectPrivacy {
+				if !hasPrivacy {
+					t.Error("Expected PRIVACY_NOTICE_URL key to exist in config response")
+				} else if privacyURL.(string) != tc.privacyNoticeURL {
+					t.Errorf("Expected PRIVACY_NOTICE_URL to be %v, got %v", tc.privacyNoticeURL, privacyURL)
+				}
+			} else {
+				if hasPrivacy {
+					t.Errorf("Expected PRIVACY_NOTICE_URL key to not exist in config response, but got %v", privacyURL)
+				}
+			}
+
+			// Check imprint URL
+			imprintURL, hasImprint := config["IMPRINT_URL"]
+			if tc.expectImprint {
+				if !hasImprint {
+					t.Error("Expected IMPRINT_URL key to exist in config response")
+				} else if imprintURL.(string) != tc.imprintURL {
+					t.Errorf("Expected IMPRINT_URL to be %v, got %v", tc.imprintURL, imprintURL)
+				}
+			} else {
+				if hasImprint {
+					t.Errorf("Expected IMPRINT_URL key to not exist in config response, but got %v", imprintURL)
+				}
+			}
+
+			// Verify that boolean config values are still present
+			if _, exists := config["DISABLE_UPLOAD"]; !exists {
+				t.Error("Expected DISABLE_UPLOAD key to exist in config response")
+			}
+			if _, exists := config["PREFETCH_SECRET"]; !exists {
+				t.Error("Expected PREFETCH_SECRET key to exist in config response")
+			}
+			if _, exists := config["DISABLE_FEATURES"]; !exists {
+				t.Error("Expected DISABLE_FEATURES key to exist in config response")
+			}
+			if _, exists := config["NO_LANGUAGE_SWITCHER"]; !exists {
+				t.Error("Expected NO_LANGUAGE_SWITCHER key to exist in config response")
+			}
+		})
+	}
+}
+
+func TestConfigHandlerPublicURL(t *testing.T) {
+	tt := []struct {
+		name          string
+		publicURL     string
+		expectPresent bool
+	}{
+		{
+			name:          "no public URL configured",
+			publicURL:     "",
+			expectPresent: false,
+		},
+		{
+			name:          "public URL configured",
+			publicURL:     "https://secrets.example.com",
+			expectPresent: true,
+		},
+		{
+			name:          "public URL with trailing slash",
+			publicURL:     "https://secrets.example.com/",
+			expectPresent: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, newMockDB(), 1, false)
+			server.PublicURL = tc.publicURL
+
+			req := httptest.NewRequest(http.MethodGet, "/config", nil)
+			w := httptest.NewRecorder()
+			server.configHandler(w, req)
+
+			res := w.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Expected status OK, got %d", res.StatusCode)
+			}
+
+			var config map[string]interface{}
+			if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+				t.Fatalf("Failed to decode response: %v", err)
+			}
+
+			val, hasKey := config["PUBLIC_URL"]
+			if tc.expectPresent {
+				if !hasKey {
+					t.Error("Expected PUBLIC_URL key to exist in config response")
+				} else if val.(string) != tc.publicURL {
+					t.Errorf("Expected PUBLIC_URL to be %q, got %q", tc.publicURL, val)
+				}
+			} else {
+				if hasKey {
+					t.Errorf("Expected PUBLIC_URL key to not exist in config response, but got %v", val)
+				}
+			}
+		})
+	}
+}
+
+func TestDisableUploadRoutes(t *testing.T) {
+	// Test with uploads disabled
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.DisableUpload = true
+	handler := server.HTTPHandler()
+
+	// Test that file upload routes are not available
+	fileRoutes := []struct {
+		method string
+		path   string
+	}{
+		{"POST", "/create/file"},
+		{"OPTIONS", "/create/file"},
+		{"GET", "/file/12345678-1234-1234-1234-123456789012"},
+		{"DELETE", "/file/12345678-1234-1234-1234-123456789012"},
+	}
+
+	for _, route := range fileRoutes {
+		req := httptest.NewRequest(route.method, route.path, nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+
+		// Should return 404 when uploads are disabled
+		if w.Code != 404 {
+			t.Errorf("Expected 404 for %s %s when uploads disabled, got %d", route.method, route.path, w.Code)
+		}
+	}
+
+	// Test with uploads enabled
+	server2 := newTestServer(t, newMockDB(), 1, false)
+	handler2 := server2.HTTPHandler()
+
+	// Test that OPTIONS /create/file is available when uploads enabled
+	req := httptest.NewRequest("OPTIONS", "/create/file", nil)
+	w := httptest.NewRecorder()
+	handler2.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Errorf("Expected 200 for OPTIONS /create/file when uploads enabled, got %d", w.Code)
+	}
+}
+
+func TestGetSecretStatus(t *testing.T) {
+	tt := []struct {
+		name       string
+		statusCode int
+		output     string
+		db         Database
+		oneTime    bool
+	}{
+		{
+			name:       "Secret exists - one time",
+			statusCode: 200,
+			output:     `{"oneTime":true,"requireAuth":false}`,
+			db:         newHandlerDB(yopass.Secret{Message: "test", OneTime: true}, true),
+			oneTime:    true,
+		},
+		{
+			name:       "Secret exists - not one time",
+			statusCode: 200,
+			output:     `{"oneTime":false,"requireAuth":false}`,
+			db:         newHandlerDB(yopass.Secret{Message: "test", OneTime: false}, true),
+			oneTime:    false,
+		},
+		{
+			name:       "Secret not found",
+			statusCode: 404,
+			output:     `{"message": "Secret not found"}`,
+			db:         newHandlerDB(yopass.Secret{Message: "test", OneTime: false}, false),
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest("GET", "/secret/foo/status", nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req = mux.SetURLVars(req, map[string]string{"key": "foo"})
+			rr := httptest.NewRecorder()
+			y := newTestServer(t, tc.db, 1, false)
+			y.secretStatusHandler("", "secret.status_checked")(rr, req)
+
+			if rr.Code != tc.statusCode {
+				t.Fatalf(`Expected status code %d; got %d`, tc.statusCode, rr.Code)
+			}
+
+			body := strings.TrimSpace(rr.Body.String())
+			if tc.statusCode == 200 {
+				if body != tc.output {
+					t.Fatalf(`Expected body "%s"; got "%s"`, tc.output, body)
+				}
+			}
+		})
+	}
+}
+
+func TestOptionsSecret(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.CORSAllowOrigin = "*"
+	handler := server.HTTPHandler()
+
+	req := httptest.NewRequest(http.MethodOptions, "/create/secret", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("Expected status OK, got %d", w.Code)
+	}
+
+	expectedHeaders := map[string]string{
+		"Access-Control-Allow-Origin":  "*",
+		"Access-Control-Allow-Methods": "POST, OPTIONS",
+		"Access-Control-Allow-Headers": "Content-Type",
+	}
+
+	for header, expected := range expectedHeaders {
+		got := w.Header().Get(header)
+		if got != expected {
+			t.Errorf("Expected header %s to be %q, got %q", header, expected, got)
+		}
+	}
+}
+
+func TestHTTPHandlerRoutes(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	handler := server.HTTPHandler()
+
+	testCases := []struct {
+		method string
+		path   string
+		status int
+	}{
+		{"GET", "/config", 200},
+		{"GET", "/version", 200},
+		{"OPTIONS", "/create/secret", 200},
+		{"OPTIONS", "/config", 200},
+	}
+
+	for _, tc := range testCases {
+		t.Run(fmt.Sprintf("%s %s", tc.method, tc.path), func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tc.status {
+				t.Errorf("Expected status %d, got %d", tc.status, w.Code)
+			}
+		})
+	}
+}
+
+func TestNormalizedPath(t *testing.T) {
+	// Test the edge case where there's no route (returns "<other>")
+	req := httptest.NewRequest("GET", "/unknown", nil)
+	result := normalizedPath(req)
+	expected := "<other>"
+	if result != expected {
+		t.Errorf("Expected %q, got %q", expected, result)
+	}
+}
+
+func TestHTTPHandlerWithConfiguration(t *testing.T) {
+	// Test with prefetch-secret enabled
+	server1 := newTestServer(t, newMockDB(), 1, false)
+	server1.PrefetchSecret = true
+	handler := server1.HTTPHandler()
+
+	req := httptest.NewRequest("GET", "/secret/12345678-1234-1234-1234-123456789012/status", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	// Should be accessible when prefetch is enabled
+	if w.Code == 404 {
+		t.Error("Status endpoint should be available when prefetch-secret is enabled")
+	}
+
+	// Uploads enabled by default
+	server2 := newTestServer(t, newMockDB(), 1, false)
+	handler2 := server2.HTTPHandler()
+
+	req2 := httptest.NewRequest("OPTIONS", "/create/file", nil)
+	w2 := httptest.NewRecorder()
+	handler2.ServeHTTP(w2, req2)
+
+	if w2.Code != 200 {
+		t.Errorf("File stream OPTIONS should be available when uploads enabled, got %d", w2.Code)
+	}
+}
+
+func TestGetSecretWithToJSONError(t *testing.T) {
+	// This test is challenging since we can't easily mock yopass.Secret.ToJSON()
+	// The ToJSON method would need to return an error, which happens very rarely
+	// in practice (only if json.Marshal fails on a simple struct)
+	// We'll test the happy path that's already covered
+}
+
+// errorWriter is a ResponseWriter that fails on Write
+type errorWriter struct {
+	http.ResponseWriter
+	headerWritten bool
+}
+
+func (w *errorWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("write error")
+}
+
+func (w *errorWriter) WriteHeader(statusCode int) {
+	if !w.headerWritten {
+		w.ResponseWriter.WriteHeader(statusCode)
+		w.headerWritten = true
+	}
+}
+
+func TestCreateSecretWriteError(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
+	server := newTestServer(t, newMockDB(), 1000, false)
+
+	body := strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n")))
+	req := httptest.NewRequest("POST", "/secret", body)
+
+	// Use error writer to trigger the error path
+	recorder := httptest.NewRecorder()
+	errWriter := &errorWriter{ResponseWriter: recorder}
+
+	server.createSecret(errWriter, req)
+
+	// The function should complete even with write error (error is just logged)
+}
+
+func TestGetSecretWriteError(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1000, false)
+
+	req := httptest.NewRequest("GET", "/secret/test", nil)
+	req = mux.SetURLVars(req, map[string]string{"key": "test"})
+
+	// Use error writer to trigger the error path
+	recorder := httptest.NewRecorder()
+	errWriter := &errorWriter{ResponseWriter: recorder}
+
+	server.getSecret(errWriter, req)
+
+	// The function should complete even with write error (error is just logged)
+}
+
+func TestGetSecretStatusWriteError(t *testing.T) {
+	server := newTestServer(t, newHandlerDB(yopass.Secret{Message: "test", OneTime: false}, true), 1000, false)
+
+	req := httptest.NewRequest("GET", "/secret/test/status", nil)
+	req = mux.SetURLVars(req, map[string]string{"key": "test"})
+
+	// Use error writer to trigger the error path
+	recorder := httptest.NewRecorder()
+	errWriter := &errorWriter{ResponseWriter: recorder}
+
+	server.secretStatusHandler("", "secret.status_checked")(errWriter, req)
+
+	// The function should complete even with write error (error is just logged)
+}
+
+func TestConfigHandlerForceOnetimeSecrets(t *testing.T) {
+	tt := []struct {
+		name     string
+		setValue bool
+		expected bool
+	}{
+		{
+			name:     "force-onetime-secrets disabled (default)",
+			setValue: false,
+			expected: false,
+		},
+		{
+			name:     "force-onetime-secrets enabled",
+			setValue: true,
+			expected: true,
+		},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, newMockDB(), 1, tc.setValue)
+
+			req := httptest.NewRequest(http.MethodGet, "/config", nil)
+			w := httptest.NewRecorder()
+			server.configHandler(w, req)
+
+			res := w.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Expected status OK, got %d", res.StatusCode)
+			}
+
+			var config map[string]interface{}
+			if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+				t.Fatalf("Failed to decode response: %v", err)
+			}
+
+			if got, want := config["FORCE_ONETIME_SECRETS"].(bool), tc.expected; got != want {
+				t.Errorf("Expected FORCE_ONETIME_SECRETS to be %v, got %v", want, got)
+			}
+
+			// Verify the key exists in the response
+			if _, exists := config["FORCE_ONETIME_SECRETS"]; !exists {
+				t.Error("Expected FORCE_ONETIME_SECRETS key to exist in config response")
+			}
+		})
+	}
+}
+
+func TestHTTPLogFormatterEdgeCases(t *testing.T) {
+	logger := zaptest.NewLogger(t)
+	server := &Server{Logger: logger}
+	formatter := server.httpLogFormatter(nil)
+
+	// Test with nil logger
+	nilServer := &Server{Logger: nil}
+	nilFormatter := nilServer.httpLogFormatter(nil)
+	if nilFormatter == nil {
+		t.Error("Formatter should not be nil even with nil logger")
+	}
+
+	// Test with nil request (error path)
+	params := handlers.LogFormatterParams{
+		Request: nil,
+	}
+	formatter(nil, params)
+
+	// Test with CONNECT method over HTTP/2
+	req := httptest.NewRequest("CONNECT", "/", nil)
+	req.ProtoMajor = 2
+	req.Host = "example.com"
+
+	params2 := handlers.LogFormatterParams{
+		Request: req,
+	}
+	formatter(nil, params2)
+}
+
+func TestIsPGPEncrypted(t *testing.T) {
+	tests := []struct {
+		name     string
+		content  string
+		expected bool
+	}{
+		{
+			name: "valid PGP message",
+			content: `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`,
+			expected: true,
+		},
+		{
+			name: "valid CLI encrypted PGP message",
+			content: `-----BEGIN PGP MESSAGE-----
+Comment: https://yopass.se
+
+wy4ECQMILuOKAclPM2xgmtofvmWNo5/cfU8W54adSd82wxlrx9dHqfqpvPZnoaWF
+0uAB5FihFdqjbxKcLB3vS5UGETHhL1Hgi+Aj4biL4HPiNPEFqOBC5GYbD5oD7xUW
+Q5FI66ugslngweHlYODQ5IWLpbwMHdiymG7uoIKUusHi1lHUv+Gx0AA=
+=YaUx
+-----END PGP MESSAGE-----`,
+			expected: true,
+		},
+		{
+			// openpgp.js terminates its armor with a newline.
+			name: "valid PGP message with trailing newline",
+			content: `-----BEGIN PGP MESSAGE-----
+Comment: https://yopass.se
+
+wy4ECQMILuOKAclPM2xgmtofvmWNo5/cfU8W54adSd82wxlrx9dHqfqpvPZnoaWF
+0uAB5FihFdqjbxKcLB3vS5UGETHhL1Hgi+Aj4biL4HPiNPEFqOBC5GYbD5oD7xUW
+Q5FI66ugslngweHlYODQ5IWLpbwMHdiymG7uoIKUusHi1lHUv+Gx0AA=
+=YaUx
+-----END PGP MESSAGE-----
+`,
+			expected: true,
+		},
+		{
+			name:     "empty string",
+			content:  "",
+			expected: false,
+		},
+		{
+			name:     "plain text",
+			content:  "hello world",
+			expected: false,
+		},
+		{
+			name:     "invalid PGP header",
+			content:  "----- PGP MESSAGE -----",
+			expected: false,
+		},
+		{
+			name:     "partial PGP message",
+			content:  "-----BEGIN PGP MESSAGE-----\nincomplete",
+			expected: false,
+		},
+		{
+			name:     "JSON content",
+			content:  `{"message": "hello"}`,
+			expected: false,
+		},
+		{
+			name:     "Base64 encoded content",
+			content:  "SGVsbG8gV29ybGQ=",
+			expected: false,
+		},
+		{
+			name:     "header with typo in block type",
+			content:  "-----BEGIN PGP MESAGE-----\n\naGVsbG8=\n-----END PGP MESAGE-----\n",
+			expected: false,
+		},
+		{
+			name:     "arbitrary block type",
+			content:  "-----BEGIN LOL-----\n\naGVsbG8=\n-----END LOL-----\n",
+			expected: false,
+		},
+		{
+			name:     "public key block instead of message",
+			content:  "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n\n-----END PGP PUBLIC KEY BLOCK-----\n",
+			expected: false,
+		},
+		{
+			name:     "missing END marker",
+			content:  "-----BEGIN PGP MESSAGE-----\n\naGVsbG8=\n",
+			expected: false,
+		},
+		{
+			// Decode skips everything before the BEGIN line, so a marker up
+			// there must not be mistaken for the block's terminator.
+			name:     "END marker before the BEGIN marker",
+			content:  "-----END PGP MESSAGE-----\n-----BEGIN PGP MESSAGE-----\n\naGVsbG8=\n",
+			expected: false,
+		},
+		{
+			// Armor header values are free text.
+			name:     "END marker planted in an armor header",
+			content:  "-----BEGIN PGP MESSAGE-----\nComment: -----END PGP MESSAGE-----\n\naGVsbG8=\n",
+			expected: false,
+		},
+		{
+			name:     "empty armor payload",
+			content:  "-----BEGIN PGP MESSAGE-----\n\n\n-----END PGP MESSAGE-----\n",
+			expected: false,
+		},
+		{
+			name:     "plaintext body inside armor headers",
+			content:  "-----BEGIN PGP MESSAGE-----\n\nmy password is hunter2\n-----END PGP MESSAGE-----\n",
+			expected: false,
+		},
+		{
+			name:     "truncated base64 body",
+			content:  "-----BEGIN PGP MESSAGE-----\n\nwy4ECQMIRthQ3aO85Nv\n-----END PGP MESSAGE-----\n",
+			expected: false,
+		},
+		{
+			name: "valid message without checksum line",
+			// The CRC24 checksum is optional since RFC 9580 and go-crypto no
+			// longer verifies it, so a message lacking one is still accepted.
+			content: `-----BEGIN PGP MESSAGE-----
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+-----END PGP MESSAGE-----`,
+			expected: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := isPGPEncrypted(test.content)
+			if result != test.expected {
+				t.Errorf("isPGPEncrypted(%q) = %v, expected %v", test.name, result, test.expected)
+			}
+		})
+	}
+}
+
+func TestCreateSecretPGPValidation(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		output     string
+		db         Database
+	}{
+		{
+			name:       "valid PGP encrypted message",
+			statusCode: 200,
+			body:       fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n")),
+			output:     "",
+			db:         newMockDB(),
+		},
+		{
+			name:       "plain text message (invalid)",
+			statusCode: 400,
+			body:       `{"message": "hello world", "expiration": 3600}`,
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+		},
+		{
+			name:       "empty message (invalid)",
+			statusCode: 400,
+			body:       `{"message": "", "expiration": 3600}`,
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+		},
+		{
+			name:       "JSON content (invalid)",
+			statusCode: 400,
+			body:       `{"message": "{\"data\": \"value\"}", "expiration": 3600}`,
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+		},
+		{
+			name:       "invalid PGP format",
+			statusCode: 400,
+			body:       `{"message": "-----BEGIN PGP MESSAGE-----\nincomplete", "expiration": 3600}`,
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, _ := http.NewRequest("POST", "/secret", strings.NewReader(test.body))
+			rr := httptest.NewRecorder()
+			y := newTestServer(t, test.db, 10000, false)
+			y.createSecret(rr, req)
+
+			if rr.Code != test.statusCode {
+				t.Fatalf(`Expected status code %d; got %d`, test.statusCode, rr.Code)
+			}
+
+			if test.output != "" {
+				var response struct {
+					Message string `json:"message"`
+				}
+				json.Unmarshal(rr.Body.Bytes(), &response)
+				if response.Message != test.output {
+					t.Fatalf(`Expected error message "%s"; got "%s"`, test.output, response.Message)
+				}
+			}
+		})
+	}
+}
+
+func TestExpirationInSeconds(t *testing.T) {
+	tt := []struct {
+		input    string
+		expected int32
+	}{
+		{"1h", 3600},
+		{"1d", 86400},
+		{"1w", 604800},
+		{"", 3600},
+		{"invalid", 3600},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.input, func(t *testing.T) {
+			got := expirationInSeconds(tc.input)
+			if got != tc.expected {
+				t.Errorf("expirationInSeconds(%q) = %d, want %d", tc.input, got, tc.expected)
+			}
+		})
+	}
+}
+
+func TestConfigHandlerDefaultExpiry(t *testing.T) {
+	tt := []struct {
+		name     string
+		setValue string
+		expected float64
+	}{
+		{"1h default", "1h", 3600},
+		{"1d", "1d", 86400},
+		{"1w", "1w", 604800},
+		{"empty falls back to 1h", "", 3600},
+	}
+
+	for _, tc := range tt {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, newMockDB(), 1, false)
+			server.DefaultExpiry = tc.setValue
+
+			req := httptest.NewRequest(http.MethodGet, "/config", nil)
+			w := httptest.NewRecorder()
+			server.configHandler(w, req)
+
+			res := w.Result()
+			defer res.Body.Close()
+
+			if res.StatusCode != http.StatusOK {
+				t.Fatalf("Expected status OK, got %d", res.StatusCode)
+			}
+
+			var config map[string]interface{}
+			if err := json.NewDecoder(res.Body).Decode(&config); err != nil {
+				t.Fatalf("Failed to decode response: %v", err)
+			}
+
+			got, ok := config["DEFAULT_EXPIRY"].(float64)
+			if !ok {
+				t.Fatalf("Expected DEFAULT_EXPIRY to be a number, got %T", config["DEFAULT_EXPIRY"])
+			}
+			if got != tc.expected {
+				t.Errorf("Expected DEFAULT_EXPIRY to be %v, got %v", tc.expected, got)
+			}
+		})
+	}
+}
+
+func TestCreateFilePGPValidation(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIHCI4BfNkxELgEICJXDZCq2zf0+DkWHGLBNoM3SzySpFzTF9dGItJ
+wCE50lQBbdoYiYZPT1+O/KCiDpC9P5ixWODZZXjUe/ZGxBvUlUrp0tx1VHWC
+dhgGsvKwXJm0kEwGwqj6mJq/j28FSFoP9Et/LtRuEe3Ct06WOrrHQ4v9DC4=
+=mja3
+-----END PGP MESSAGE-----`
+
+	tests := []struct {
+		name       string
+		statusCode int
+		body       string
+		output     string
+		db         Database
+	}{
+		{
+			name:       "valid PGP encrypted file",
+			statusCode: 200,
+			body:       fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n")),
+			output:     "",
+			db:         newMockDB(),
+		},
+		{
+			name:       "plain text file content (invalid)",
+			statusCode: 400,
+			body:       `{"message": "file content here", "expiration": 3600}`,
+			output:     "Message must be PGP encrypted",
+			db:         newMockDB(),
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req, _ := http.NewRequest("POST", "/file", strings.NewReader(test.body))
+			rr := httptest.NewRecorder()
+			y := newTestServer(t, test.db, 10000, false)
+			y.createSecret(rr, req) // Both /secret and /file use createSecret handler
+
+			if rr.Code != test.statusCode {
+				t.Fatalf(`Expected status code %d; got %d`, test.statusCode, rr.Code)
+			}
+
+			if test.output != "" {
+				var response struct {
+					Message string `json:"message"`
+				}
+				json.Unmarshal(rr.Body.Bytes(), &response)
+				if response.Message != test.output {
+					t.Fatalf(`Expected error message "%s"; got "%s"`, test.output, response.Message)
+				}
+			}
+		})
+	}
+}
+
+func TestHealthHandler(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		db         Database
+		checkBody  func(t *testing.T, body string)
+	}{
+		{
+			name:       "healthy database returns 200",
+			statusCode: 200,
+			db:         newMockHealthDB(true),
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"healthy"`) {
+					t.Errorf("expected healthy status in response: %s", body)
+				}
+			},
+		},
+		{
+			name:       "unhealthy database still returns 200 (liveness check)",
+			statusCode: 200,
+			db:         newMockHealthDB(false),
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"healthy"`) {
+					t.Errorf("expected healthy status in response even with unhealthy DB: %s", body)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/health", nil)
+			rr := httptest.NewRecorder()
+			y := newTestServer(t, tc.db, 1, false)
+			y.healthHandler(rr, req)
+
+			if rr.Code != tc.statusCode {
+				t.Fatalf("expected status code %d; got %d", tc.statusCode, rr.Code)
+			}
+
+			tc.checkBody(t, rr.Body.String())
+		})
+	}
+}
+
+func TestReadyHandler(t *testing.T) {
+	tests := []struct {
+		name       string
+		statusCode int
+		db         Database
+		checkBody  func(t *testing.T, body string)
+	}{
+		{
+			name:       "healthy database returns 200",
+			statusCode: 200,
+			db:         newMockHealthDB(true),
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"ready"`) {
+					t.Errorf("expected ready status in response: %s", body)
+				}
+			},
+		},
+		{
+			name:       "unhealthy database returns 503",
+			statusCode: 503,
+			db:         newMockHealthDB(false),
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"not ready"`) {
+					t.Errorf("expected not ready status in response: %s", body)
+				}
+				if !strings.Contains(body, `"error":"database connectivity failed"`) {
+					t.Errorf("expected error message in response: %s", body)
+				}
+			},
+		},
+		{
+			name:       "nil database returns 503",
+			statusCode: 503,
+			db:         nil,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"not ready"`) {
+					t.Errorf("expected not ready status in response: %s", body)
+				}
+				if !strings.Contains(body, `"error":"database not configured"`) {
+					t.Errorf("expected database not configured error in response: %s", body)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/ready", nil)
+			rr := httptest.NewRecorder()
+			y := newTestServer(t, tc.db, 1, false)
+			y.readyHandler(rr, req)
+
+			if rr.Code != tc.statusCode {
+				t.Fatalf("expected status code %d; got %d", tc.statusCode, rr.Code)
+			}
+
+			tc.checkBody(t, rr.Body.String())
+		})
+	}
+}
+
+func TestHealthEndpointRoutes(t *testing.T) {
+	tests := []struct {
+		name      string
+		db        Database
+		method    string
+		path      string
+		status    int
+		checkBody func(t *testing.T, body string)
+	}{
+		{
+			name:   "GET /health with healthy DB returns 200",
+			db:     newMockHealthDB(true),
+			method: "GET",
+			path:   "/health",
+			status: 200,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"healthy"`) {
+					t.Errorf("expected healthy status in response: %s", body)
+				}
+			},
+		},
+		{
+			name:      "HEAD /health with healthy DB returns 200",
+			db:        newMockHealthDB(true),
+			method:    "HEAD",
+			path:      "/health",
+			status:    200,
+			checkBody: nil,
+		},
+		{
+			name:   "GET /health with unhealthy DB returns 200 (liveness)",
+			db:     newMockHealthDB(false),
+			method: "GET",
+			path:   "/health",
+			status: 200,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"healthy"`) {
+					t.Errorf("expected healthy status even with unhealthy DB: %s", body)
+				}
+			},
+		},
+		{
+			name:   "GET /ready with healthy DB returns 200",
+			db:     newMockHealthDB(true),
+			method: "GET",
+			path:   "/ready",
+			status: 200,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"ready"`) {
+					t.Errorf("expected ready status in response: %s", body)
+				}
+			},
+		},
+		{
+			name:      "HEAD /ready with healthy DB returns 200",
+			db:        newMockHealthDB(true),
+			method:    "HEAD",
+			path:      "/ready",
+			status:    200,
+			checkBody: nil,
+		},
+		{
+			name:   "GET /ready with unhealthy DB returns 503",
+			db:     newMockHealthDB(false),
+			method: "GET",
+			path:   "/ready",
+			status: 503,
+			checkBody: func(t *testing.T, body string) {
+				if !strings.Contains(body, `"status":"not ready"`) {
+					t.Errorf("expected not ready status in response: %s", body)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := newTestServer(t, tc.db, 1, false)
+			handler := server.HTTPHandler()
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			w := httptest.NewRecorder()
+			handler.ServeHTTP(w, req)
+
+			if w.Code != tc.status {
+				t.Errorf("Expected status %d, got %d", tc.status, w.Code)
+			}
+
+			if tc.checkBody != nil {
+				tc.checkBody(t, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestReadOnlyMode(t *testing.T) {
+	testUUID := "12345678-1234-1234-1234-123456789012"
+
+	// Use testDB pre-seeded with secret and file data so retrieval endpoints work
+	db := newTestDB()
+	db.Put(testUUID, yopass.Secret{Message: "***ENCRYPTED***", OneTime: false})
+	db.Put(streamKeyPrefix+testUUID, yopass.Secret{Message: "test.bin", OneTime: false})
+	fs := NewDatabaseFileStore(db)
+	fs.Save(context.Background(), testUUID, strings.NewReader("pgp-data"), 8, 3600)
+
+	y := Server{
+		DB:                  db,
+		FileStore:           fs,
+		MaxLength:           10000,
+		Registry:            prometheus.NewRegistry(),
+		ForceOneTimeSecrets: false,
+		Logger:              zaptest.NewLogger(t),
+		ReadOnly:            true,
+	}
+	handler := y.HTTPHandler()
+
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		statusCode int
+		testFunc   func(*testing.T, *httptest.ResponseRecorder)
+	}{
+		{
+			name:       "config endpoint exposes READ_ONLY true",
+			method:     "GET",
+			path:       "/config",
+			statusCode: 200,
+			testFunc: func(t *testing.T, rr *httptest.ResponseRecorder) {
+				var config map[string]interface{}
+				if err := json.Unmarshal(rr.Body.Bytes(), &config); err != nil {
+					t.Fatalf("Failed to unmarshal config: %v", err)
+				}
+				if readOnly, ok := config["READ_ONLY"].(bool); !ok || !readOnly {
+					t.Fatalf("Expected READ_ONLY to be true, got %v", config["READ_ONLY"])
+				}
+			},
+		},
+		{
+			name:       "POST /create/secret returns 404 in read-only mode",
+			method:     "POST",
+			path:       "/create/secret",
+			body:       fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n")),
+			statusCode: 404,
+		},
+		{
+			name:       "POST /create/file returns 404 in read-only mode",
+			method:     "POST",
+			path:       "/create/file",
+			statusCode: 404,
+		},
+		{
+			name:       "GET /secret/{key} works in read-only mode",
+			method:     "GET",
+			path:       "/secret/" + testUUID,
+			statusCode: 200,
+		},
+		{
+			name:       "GET /file/{key} works in read-only mode",
+			method:     "GET",
+			path:       "/file/" + testUUID,
+			statusCode: 200,
+		},
+		{
+			name:       "DELETE /secret/{key} works in read-only mode",
+			method:     "DELETE",
+			path:       "/secret/" + testUUID,
+			statusCode: 204,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req *http.Request
+			if tt.body != "" {
+				req = httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			} else {
+				req = httptest.NewRequest(tt.method, tt.path, nil)
+			}
+			rr := httptest.NewRecorder()
+
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tt.statusCode {
+				t.Fatalf("Expected status code %d; got %d", tt.statusCode, rr.Code)
+			}
+
+			if tt.testFunc != nil {
+				tt.testFunc(t, rr)
+			}
+		})
+	}
+}
+
+func TestNormalMode(t *testing.T) {
+	y := newTestServer(t, newMockDB(), 10000, false)
+	handler := y.HTTPHandler()
+
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+
+	tests := []struct {
+		name       string
+		method     string
+		path       string
+		body       string
+		statusCode int
+		testFunc   func(*testing.T, *httptest.ResponseRecorder)
+	}{
+		{
+			name:       "config endpoint exposes READ_ONLY false",
+			method:     "GET",
+			path:       "/config",
+			statusCode: 200,
+			testFunc: func(t *testing.T, rr *httptest.ResponseRecorder) {
+				var config map[string]interface{}
+				if err := json.Unmarshal(rr.Body.Bytes(), &config); err != nil {
+					t.Fatalf("Failed to unmarshal config: %v", err)
+				}
+				if readOnly, ok := config["READ_ONLY"].(bool); !ok || readOnly {
+					t.Fatalf("Expected READ_ONLY to be false, got %v", config["READ_ONLY"])
+				}
+			},
+		},
+		{
+			name:       "POST /create/secret works in normal mode",
+			method:     "POST",
+			path:       "/create/secret",
+			body:       fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, strings.ReplaceAll(validPGPMessage, "\n", "\\n")),
+			statusCode: 200,
+		},
+		{
+			name:       "POST /create/file works in normal mode",
+			method:     "POST",
+			path:       "/create/file",
+			statusCode: 400, // 400 because no headers/body, but route exists (not 404)
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var req *http.Request
+			if tt.body != "" {
+				req = httptest.NewRequest(tt.method, tt.path, strings.NewReader(tt.body))
+			} else {
+				req = httptest.NewRequest(tt.method, tt.path, nil)
+			}
+			rr := httptest.NewRecorder()
+
+			handler.ServeHTTP(rr, req)
+
+			if rr.Code != tt.statusCode {
+				t.Fatalf("Expected status code %d; got %d", tt.statusCode, rr.Code)
+			}
+
+			if tt.testFunc != nil {
+				tt.testFunc(t, rr)
+			}
+		})
+	}
+}
+
+func TestCORSMiddlewareFrontendURLStripsPath(t *testing.T) {
+	// frontend-url with a path prefix — ACAO must be scheme://host only.
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.FrontendURL = "https://example.com/app"
+	handler := server.HTTPHandler()
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	got := w.Header().Get("Access-Control-Allow-Origin")
+	want := "https://example.com"
+	if got != want {
+		t.Errorf("Access-Control-Allow-Origin: got %q, want %q", got, want)
+	}
+}
+
+func TestCORSMiddlewareFrontendURLNoPath(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.FrontendURL = "https://app.example.com"
+	handler := server.HTTPHandler()
+
+	req := httptest.NewRequest(http.MethodGet, "/config", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	got := w.Header().Get("Access-Control-Allow-Origin")
+	want := "https://app.example.com"
+	if got != want {
+		t.Errorf("Access-Control-Allow-Origin: got %q, want %q", got, want)
+	}
+}
+
+func TestCORSMiddlewareRejectsCrossOriginCSRF(t *testing.T) {
+	server := newTestServer(t, newMockDB(), 1, false)
+	server.FrontendURL = "https://app.example.com"
+	handler := server.HTTPHandler()
+
+	t.Run("mismatched origin on POST is rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Origin", "https://evil.com")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code != http.StatusForbidden {
+			t.Errorf("expected 403 for mismatched origin, got %d", w.Code)
+		}
+	})
+
+	t.Run("matching origin on POST is allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("expected matching origin to pass CSRF check, got 403")
+		}
+	})
+
+	t.Run("GET with mismatched origin is allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		req.Header.Set("Origin", "https://evil.com")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("GET should not be subject to CSRF origin check")
+		}
+	})
+
+	t.Run("POST without origin header is allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("same-origin POST (no Origin header) should not be blocked")
+		}
+	})
+
+	t.Run("default port in frontend-url matches browser origin without port", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.FrontendURL = "https://app.example.com:443"
+		h := s.HTTPHandler()
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("default-port origin should match, got 403")
+		}
+	})
+
+	t.Run("mixed case host matches", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.FrontendURL = "https://App.Example.COM"
+		h := s.HTTPHandler()
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Origin", "https://app.example.com")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("case-insensitive host should match, got 403")
+		}
+	})
+
+	t.Run("IPv6 literal origin matches", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.FrontendURL = "https://[::1]:443"
+		h := s.HTTPHandler()
+		req := httptest.NewRequest(http.MethodPost, "/create/secret", nil)
+		req.Header.Set("Origin", "https://[::1]")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		if w.Code == http.StatusForbidden {
+			t.Errorf("IPv6 origin with default port stripped should match, got 403")
+		}
+	})
+}
+
+// TestConfigHandler_LicensedBranches covers the optional config fields and
+// License.Valid branches of configHandler that the existing TestConfigHandler*
+// tests do not reach: MAX_FILE_SIZE, LOGO_URL, OIDC_ENABLED/REQUIRE_AUTH,
+// THEME_CUSTOM_*, APP_NAME, and the unlicensed fallback theme.
+func TestConfigHandler_LicensedBranches(t *testing.T) {
+	t.Run("unlicensed defaults omit custom branding", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.LogoURL = "https://cdn.example/logo.svg" // ignored without license
+		s.AppName = "Ignored"                      // ignored without license
+		s.MaxFileSize = 0
+		s.License = LicenseStatus{} // not valid
+
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		if cfg["THEME_LIGHT"] != "emerald" || cfg["THEME_DARK"] != "dim" {
+			t.Fatalf("expected fallback emerald/dim themes, got %v / %v", cfg["THEME_LIGHT"], cfg["THEME_DARK"])
+		}
+		for _, key := range []string{"LOGO_URL", "APP_NAME", "THEME_CUSTOM_LIGHT", "THEME_CUSTOM_DARK", "MAX_FILE_SIZE"} {
+			if _, ok := cfg[key]; ok {
+				t.Errorf("expected %q to be absent, got %v", key, cfg[key])
+			}
+		}
+		if cfg["OIDC_ENABLED"] != false || cfg["REQUIRE_AUTH"] != false {
+			t.Errorf("expected OIDC_ENABLED=false and REQUIRE_AUTH=false, got %v / %v", cfg["OIDC_ENABLED"], cfg["REQUIRE_AUTH"])
+		}
+	})
+
+	t.Run("licensed full branding", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.LogoURL = "https://cdn.example/logo.svg"
+		s.AppName = "Acme Secrets"
+		s.ThemeLight = "bumblebee"
+		s.ThemeDark = "night"
+		s.ThemeCustomLight = `{"--color-primary":"#abcdef"}`
+		s.ThemeCustomDark = `{"--color-primary":"#012345"}`
+		s.PrivacyNoticeURL = "https://example/privacy"
+		s.ImprintURL = "https://example/imprint"
+		s.RequireAuth = true
+		s.MaxFileSize = 1024 * 1024
+		s.License = LicenseStatus{Valid: true, Licensee: "acme", ExpiresAt: time.Now().Add(24 * time.Hour)}
+		s.OIDCProvider = &mockOIDCProvider{}
+
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		if cfg["LOGO_URL"] != "https://cdn.example/logo.svg" {
+			t.Errorf("LOGO_URL: got %v", cfg["LOGO_URL"])
+		}
+		if cfg["APP_NAME"] != "Acme Secrets" {
+			t.Errorf("APP_NAME: got %v", cfg["APP_NAME"])
+		}
+		if cfg["THEME_LIGHT"] != "bumblebee" || cfg["THEME_DARK"] != "night" {
+			t.Errorf("theme: got %v / %v", cfg["THEME_LIGHT"], cfg["THEME_DARK"])
+		}
+		light, ok := cfg["THEME_CUSTOM_LIGHT"].(map[string]interface{})
+		if !ok || light["--color-primary"] != "#abcdef" {
+			t.Errorf("THEME_CUSTOM_LIGHT: got %v", cfg["THEME_CUSTOM_LIGHT"])
+		}
+		dark, ok := cfg["THEME_CUSTOM_DARK"].(map[string]interface{})
+		if !ok || dark["--color-primary"] != "#012345" {
+			t.Errorf("THEME_CUSTOM_DARK: got %v", cfg["THEME_CUSTOM_DARK"])
+		}
+		if cfg["PRIVACY_NOTICE_URL"] != "https://example/privacy" {
+			t.Errorf("PRIVACY_NOTICE_URL: got %v", cfg["PRIVACY_NOTICE_URL"])
+		}
+		if cfg["IMPRINT_URL"] != "https://example/imprint" {
+			t.Errorf("IMPRINT_URL: got %v", cfg["IMPRINT_URL"])
+		}
+		if cfg["MAX_FILE_SIZE"] == nil {
+			t.Errorf("MAX_FILE_SIZE should be set when MaxFileSize > 0")
+		}
+		if cfg["OIDC_ENABLED"] != true || cfg["REQUIRE_AUTH"] != true {
+			t.Errorf("expected OIDC_ENABLED=true and REQUIRE_AUTH=true, got %v / %v", cfg["OIDC_ENABLED"], cfg["REQUIRE_AUTH"])
+		}
+	})
+
+	// A license expiring while the server runs must degrade /config to the
+	// unlicensed shape without a restart — except authentication, which stays
+	// active so RequireAuth secrets are neither exposed nor stranded.
+	t.Run("license expired at runtime degrades to unlicensed config", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.LogoURL = "https://cdn.example/logo.svg"
+		s.AppName = "Acme Secrets"
+		s.RequireAuth = true
+		s.OIDCProvider = &mockOIDCProvider{}
+		s.MaxFileSize = 100 * 1024 * 1024
+		s.License = LicenseStatus{Valid: true, Licensee: "acme", ExpiresAt: time.Now().Add(-time.Minute)}
+
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		if cfg["THEME_LIGHT"] != "emerald" || cfg["THEME_DARK"] != "dim" {
+			t.Fatalf("expected fallback emerald/dim themes, got %v / %v", cfg["THEME_LIGHT"], cfg["THEME_DARK"])
+		}
+		for _, key := range []string{"LOGO_URL", "APP_NAME"} {
+			if _, ok := cfg[key]; ok {
+				t.Errorf("expected %q to be absent after expiry, got %v", key, cfg[key])
+			}
+		}
+		if cfg["SECRET_REQUESTS"] != false || cfg["READ_RECEIPTS"] != false {
+			t.Errorf("expected SECRET_REQUESTS=false and READ_RECEIPTS=false, got %v / %v", cfg["SECRET_REQUESTS"], cfg["READ_RECEIPTS"])
+		}
+		if cfg["MAX_FILE_SIZE"] != FormatSize(UnlicensedMaxFileSize) {
+			t.Errorf("expected MAX_FILE_SIZE capped to %s, got %v", FormatSize(UnlicensedMaxFileSize), cfg["MAX_FILE_SIZE"])
+		}
+		// Authentication is deliberately not degraded at runtime.
+		if cfg["OIDC_ENABLED"] != true || cfg["REQUIRE_AUTH"] != true {
+			t.Errorf("expected auth to stay active, got OIDC_ENABLED=%v REQUIRE_AUTH=%v", cfg["OIDC_ENABLED"], cfg["REQUIRE_AUTH"])
+		}
+	})
+
+	t.Run("licensed with invalid theme JSON skips custom vars", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.ThemeCustomLight = "{not-json"
+		s.ThemeCustomDark = "also not json"
+		s.License = LicenseStatus{Valid: true, ExpiresAt: time.Now().Add(24 * time.Hour)}
+
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if _, ok := cfg["THEME_CUSTOM_LIGHT"]; ok {
+			t.Error("invalid JSON should omit THEME_CUSTOM_LIGHT")
+		}
+		if _, ok := cfg["THEME_CUSTOM_DARK"]; ok {
+			t.Error("invalid JSON should omit THEME_CUSTOM_DARK")
+		}
+	})
+}
+
+func TestEffectiveMaxFileSize(t *testing.T) {
+	valid := LicenseStatus{Valid: true, ExpiresAt: time.Now().Add(time.Hour)}
+	expired := LicenseStatus{Valid: true, ExpiresAt: time.Now().Add(-time.Minute)}
+
+	cases := []struct {
+		name    string
+		license LicenseStatus
+		max     int64
+		want    int64
+	}{
+		{"valid license keeps large limit", valid, 100 * 1024 * 1024, 100 * 1024 * 1024},
+		{"expired license caps large limit", expired, 100 * 1024 * 1024, UnlicensedMaxFileSize},
+		{"expired license keeps limit under cap", expired, 512 * 1024, 512 * 1024},
+		{"no license caps large limit", LicenseStatus{}, 100 * 1024 * 1024, UnlicensedMaxFileSize},
+		{"unlimited stays unlimited", expired, 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := Server{License: tc.license, MaxFileSize: tc.max}
+			if got := s.effectiveMaxFileSize(); got != tc.want {
+				t.Errorf("effectiveMaxFileSize() = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLogoHandler(t *testing.T) {
+	t.Run("serves existing svg", func(t *testing.T) {
+		dir := t.TempDir()
+		body := []byte(`<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>`)
+		if err := os.WriteFile(filepath.Join(dir, "yopass.svg"), body, 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.AssetPath = dir
+
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
+		w := httptest.NewRecorder()
+		s.logoHandler(w, req)
+
+		res := w.Result()
+		defer res.Body.Close()
+		if res.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", res.StatusCode)
+		}
+		got, _ := io.ReadAll(res.Body)
+		if string(got) != string(body) {
+			t.Errorf("body: got %q, want %q", string(got), string(body))
+		}
+	})
+
+	t.Run("missing svg returns 404", func(t *testing.T) {
+		s := newTestServer(t, newMockDB(), 1, false)
+		s.AssetPath = t.TempDir() // empty directory
+
+		req := httptest.NewRequest(http.MethodGet, "/logo.svg", nil)
+		w := httptest.NewRecorder()
+		s.logoHandler(w, req)
+
+		if w.Code != http.StatusNotFound {
+			t.Fatalf("expected 404, got %d", w.Code)
+		}
+	})
+}
+
+func TestCreateSecret_ForceExpiration(t *testing.T) {
+	validPGPMessage := `-----BEGIN PGP MESSAGE-----
+Version: OpenPGP.js v4.10.8
+Comment: https://openpgpjs.org
+
+wy4ECQMIRthQ3aO85NvgAfASIX3dTwsFVt0gshPu7n1tN05e8rpqxOk6PYNm
+xtt90k4BqHuTCLNlFRJjuiuE8zdIc+j5zTN5zihxUReVqokeqULLOx2FBMHZ
+sbfqaG/iDbp+qDOc98IagMyPrEqKDxnhVVOraXy5dD9RDsntLso=
+=0vwU
+-----END PGP MESSAGE-----`
+	escapedPGP := strings.ReplaceAll(validPGPMessage, "\n", "\\n")
+
+	t.Run("reject when expiration does not match forced value", func(t *testing.T) {
+		y := newTestServer(t, newMockDB(), 10000, false)
+		y.ForceExpiration = "1h"
+		body := strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 86400}`, escapedPGP))
+		req, _ := http.NewRequest("POST", "/secret", body)
+		rr := httptest.NewRecorder()
+		y.createSecret(rr, req)
+
+		if rr.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400, got %d", rr.Code)
+		}
+		var s yopass.Secret
+		json.Unmarshal(rr.Body.Bytes(), &s)
+		if !strings.Contains(s.Message, "server policy") {
+			t.Fatalf("expected policy error, got %q", s.Message)
+		}
+	})
+
+	t.Run("accept when expiration matches forced value", func(t *testing.T) {
+		y := newTestServer(t, newMockDB(), 10000, false)
+		y.ForceExpiration = "1h"
+		body := strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 3600}`, escapedPGP))
+		req, _ := http.NewRequest("POST", "/secret", body)
+		rr := httptest.NewRecorder()
+		y.createSecret(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+	})
+
+	t.Run("no enforcement when force-expiration is empty", func(t *testing.T) {
+		y := newTestServer(t, newMockDB(), 10000, false)
+		body := strings.NewReader(fmt.Sprintf(`{"message": "%s", "expiration": 86400}`, escapedPGP))
+		req, _ := http.NewRequest("POST", "/secret", body)
+		rr := httptest.NewRecorder()
+		y.createSecret(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expected 200, got %d", rr.Code)
+		}
+	})
+}
+
+func TestConfigHandler_ForceExpiration(t *testing.T) {
+	t.Run("includes FORCE_EXPIRATION when set", func(t *testing.T) {
+		s := &Server{
+			Registry:        prometheus.NewRegistry(),
+			Logger:          zaptest.NewLogger(t),
+			ForceExpiration: "1d",
+		}
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		fe, ok := cfg["FORCE_EXPIRATION"]
+		if !ok {
+			t.Fatal("FORCE_EXPIRATION missing from config")
+		}
+		if fe.(float64) != 86400 {
+			t.Fatalf("expected 86400, got %v", fe)
+		}
+	})
+
+	t.Run("omits FORCE_EXPIRATION when not set", func(t *testing.T) {
+		s := &Server{
+			Registry: prometheus.NewRegistry(),
+			Logger:   zaptest.NewLogger(t),
+		}
+		req := httptest.NewRequest(http.MethodGet, "/config", nil)
+		w := httptest.NewRecorder()
+		s.configHandler(w, req)
+
+		var cfg map[string]interface{}
+		if err := json.NewDecoder(w.Result().Body).Decode(&cfg); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+
+		if _, ok := cfg["FORCE_EXPIRATION"]; ok {
+			t.Fatal("FORCE_EXPIRATION should not be in config when not set")
+		}
+	})
+}
+
+func TestSensitiveResponsesNoStore(t *testing.T) {
+	s := newOIDCTestServer(t)
+	tests := []struct {
+		name    string
+		handler http.HandlerFunc
+	}{
+		{"secret", s.getSecret},
+		{"secret status", s.secretStatusHandler("", "secret.status_checked")},
+		{"file status", s.secretStatusHandler(streamKeyPrefix, "file.status_checked")},
+		{"file download", s.streamDownload},
+		{"receipt", s.getSecretReceipt},
+		{"request", s.getSecretRequest},
+		{"request secret", s.fetchRequestSecret},
+		{"identity", s.oidcMeHandler},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			tt.handler(w, httptest.NewRequest(http.MethodGet, "/missing", nil))
+			if cc := w.Result().Header.Get("Cache-Control"); cc != "no-store" {
+				t.Fatalf("got Cache-Control %q, want no-store", cc)
+			}
+		})
+	}
+}
+
+func TestStaticAssetsRequireConfiguredPath(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"bootstrap", "yopass.svg"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("asset contents"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Chdir(dir)
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprint(configured), func(t *testing.T) {
+			s := newTestServer(t, newMockDB(), 1, false)
+			want := http.StatusNotFound
+			if configured {
+				s.AssetPath = dir
+				want = http.StatusOK
+			}
+			h := s.HTTPHandler()
+			for _, path := range []string{"/", "/bootstrap", "/logo"} {
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+				if w.Code != want {
+					t.Errorf("GET %s = %d; want %d", path, w.Code, want)
+				}
+			}
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/config", nil))
+			if w.Code != http.StatusOK {
+				t.Errorf("API should remain available: /config = %d", w.Code)
+			}
+		})
 	}
 }

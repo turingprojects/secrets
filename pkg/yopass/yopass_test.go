@@ -4,14 +4,14 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
 	"github.com/jhaals/yopass/pkg/yopass"
-	"golang.org/x/crypto/openpgp"
-	"golang.org/x/crypto/openpgp/armor"
 )
 
 func TestSecretJSON(t *testing.T) {
@@ -77,6 +77,20 @@ Q5FI66ugslngweHlYODQ5IWLpbwMHdiymG7uoIKUusHi1lHUv+Gx0AA=
 			content: "cli secret message",
 		},
 		{
+			name: "aead encrypted (SEIPDv2/GCM)",
+			msg: `-----BEGIN PGP MESSAGE-----
+Comment: https://yopass.se
+
+w0wGGgkDCwMIPs3irOnCQEvgbpOkU4RQyXA8A27SsXr63BxmV0/YNxqhkF5zTrtV
+FKfZE4WLhbWt4VJzDk/56ltIL91uqdY827pj7HFQ0l0CCQMMRipaKrKyyktyUW/w
+4kfFXE46fH+XIjb9Gn9K6LlPChzC6EHSHV43LC7uXtnTKmXNJqWkb5aZodU4w5uQ
+6DQzN2jeA0hmVTiZkkqEWbvvogpb8RnDh7jmgaA=
+=9Y3B
+-----END PGP MESSAGE-----`,
+			key:     "TestAEADKey12345678901",
+			content: "aead test message",
+		},
+		{
 			name: "garbage message",
 			msg:  "----- PGP MESSAGE -----",
 			err:  yopass.ErrInvalidMessage,
@@ -134,7 +148,7 @@ func TestEncrypt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := ioutil.ReadAll(md.UnverifiedBody)
+	got, err := io.ReadAll(md.UnverifiedBody)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,6 +174,64 @@ func TestEncryptWithInvalidFile(t *testing.T) {
 	want := "could not copy data: Broken I/O"
 	if err.Error() != want {
 		t.Fatalf("expected %s, got %v", want, err)
+	}
+}
+
+// TestEncryptErrorHandling verifies that Encrypt properly handles and returns errors.
+// Note: Close() errors from armor.Encode and openpgp.SymmetricallyEncrypt are difficult
+// to test without dependency injection, as they require triggering internal failures
+// in the openpgp library. The error handling for these Close() calls is defensive
+// programming that protects against rare edge cases (e.g., finalization failures).
+func TestEncryptErrorHandling(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     io.Reader
+		key       string
+		wantError string
+	}{
+		{
+			name:      "empty key",
+			input:     strings.NewReader("test"),
+			key:       "",
+			wantError: "empty encryption key",
+		},
+		{
+			name:      "read error during copy",
+			input:     invalidFile{},
+			key:       "validkey123456789012",
+			wantError: "could not copy data",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := yopass.Encrypt(tt.input, tt.key)
+			if err == nil {
+				t.Fatal("expected error, got none")
+			}
+			if !strings.Contains(err.Error(), tt.wantError) {
+				t.Errorf("expected error containing %q, got %v", tt.wantError, err)
+			}
+		})
+	}
+}
+
+func TestGenerateID(t *testing.T) {
+	format := regexp.MustCompile("^[a-zA-Z0-9]{22}$")
+
+	seen := make(map[string]struct{})
+	for i := 0; i < 10_000; i++ {
+		id, err := yopass.GenerateID()
+		if err != nil {
+			t.Fatalf("expected no error, got %v", err)
+		}
+		if !format.MatchString(id) {
+			t.Errorf("expected ID format %q, got %q", format.String(), id)
+		}
+		if _, ok := seen[id]; ok {
+			t.Errorf("expected ID to be unique, got %q more than once", id)
+		}
+		seen[id] = struct{}{}
 	}
 }
 
@@ -238,6 +310,13 @@ func TestSecretURL(t *testing.T) {
 			kOpt: true,
 			want: "https://yopass.se/#/f/7a43c54c-6dad-4f98-b422-589021d1ac87",
 		},
+		{
+			name: "base62 ID",
+			url:  "https://yopass.se",
+			id:   "0A1b2C3d4E5f6G7h8I9j0K",
+			key:  "X9eSZdgUOXSJ3ft0TXAfWT",
+			want: "https://yopass.se/#/s/0A1b2C3d4E5f6G7h8I9j0K/X9eSZdgUOXSJ3ft0TXAfWT",
+		},
 	}
 
 	for _, tt := range tests {
@@ -247,6 +326,50 @@ func TestSecretURL(t *testing.T) {
 				t.Errorf("expected %q, got %q", tt.want, have)
 			}
 		})
+	}
+}
+
+func TestEncryptBinary(t *testing.T) {
+	plaintext := "binary test message"
+	key := "TestBinaryKey1234567890"
+	filename := "test.bin"
+
+	encrypted, err := yopass.EncryptBinary(strings.NewReader(plaintext), key, filename)
+	if err != nil {
+		t.Fatalf("EncryptBinary failed: %v", err)
+	}
+	if len(encrypted) == 0 {
+		t.Fatal("expected non-empty encrypted data")
+	}
+	// Should NOT be armored
+	if bytes.HasPrefix(encrypted, []byte("-----BEGIN PGP MESSAGE-----")) {
+		t.Fatal("expected binary format, got armored")
+	}
+
+	// Round-trip: decrypt should auto-detect binary
+	content, name, err := yopass.Decrypt(bytes.NewReader(encrypted), key)
+	if err != nil {
+		t.Fatalf("Decrypt of binary message failed: %v", err)
+	}
+	if content != plaintext {
+		t.Errorf("expected %q, got %q", plaintext, content)
+	}
+	if name != filename {
+		t.Errorf("expected filename %q, got %q", filename, name)
+	}
+}
+
+func TestEncryptBinaryEmptyKey(t *testing.T) {
+	_, err := yopass.EncryptBinary(strings.NewReader("test"), "", "file.txt")
+	if !errors.Is(err, yopass.ErrEmptyKey) {
+		t.Errorf("expected ErrEmptyKey, got %v", err)
+	}
+}
+
+func TestEncryptBinaryReadError(t *testing.T) {
+	_, err := yopass.EncryptBinary(invalidFile{}, "somekey12345678901234", "file.txt")
+	if err == nil {
+		t.Fatal("expected error, got none")
 	}
 }
 
@@ -291,6 +414,19 @@ func TestParseURL(t *testing.T) {
 			id:      "7a43c54c-6dad-4f98-b422-589021d1ac87",
 			fileOpt: true,
 			keyOpt:  true,
+		},
+		{
+			name: "base62 ID",
+			url:  "https://yopass.se/#/s/0A1b2C3d4E5f6G7h8I9j0K/sLYp6skAIhkUnfUMimVU5O",
+			id:   "0A1b2C3d4E5f6G7h8I9j0K",
+			key:  "sLYp6skAIhkUnfUMimVU5O",
+		},
+		{
+			name:    "base62 ID file",
+			url:     "https://yopass.se/#/f/0A1b2C3d4E5f6G7h8I9j0K/ZMprbkA78FkEWAbrXKK06y",
+			id:      "0A1b2C3d4E5f6G7h8I9j0K",
+			key:     "ZMprbkA78FkEWAbrXKK06y",
+			fileOpt: true,
 		},
 		{
 			name: "invalid URL",

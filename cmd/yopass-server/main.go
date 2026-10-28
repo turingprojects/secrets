@@ -4,76 +4,178 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
-	"flag"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jhaals/yopass/pkg/server"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/spf13/pflag"
+	"github.com/jhaals/yopass/pkg/yopass"
 	"github.com/spf13/viper"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
-
-var logLevel zapcore.Level
-
-func init() {
-	pflag.String("address", "", "listen address (default 0.0.0.0)")
-	pflag.Int("port", 1337, "listen port")
-	pflag.String("database", "memcached", "database backend ('memcached' or 'redis')")
-	pflag.String("asset-path", "public", "path to the assets folder")
-	pflag.Int("max-length", 10000, "max length of encrypted secret")
-	pflag.String("memcached", "localhost:11211", "memcached address")
-	pflag.Int("metrics-port", -1, "metrics server listen port")
-	pflag.String("redis", "redis://localhost:6379/0", "Redis URL")
-	pflag.String("tls-cert", "", "path to TLS certificate")
-	pflag.String("tls-key", "", "path to TLS key")
-	pflag.Bool("force-onetime-secrets", false, "reject non onetime secrets from being created")
-	pflag.String("cors-allow-origin", "*", "Access-Control-Allow-Origin")
-	pflag.Bool("disable-upload", false, "disable the /file upload endpoints")
-	pflag.CommandLine.AddGoFlag(&flag.Flag{Name: "log-level", Usage: "Log level", Value: &logLevel})
-
-	viper.AutomaticEnv()
-	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
-	_ = viper.BindPFlags(pflag.CommandLine)
-
-	pflag.Parse()
-}
 
 func main() {
 	logger := configureZapLogger()
+
+	// Handle health check mode
+	if viper.GetBool("health-check") {
+		db, err := setupDatabase(logger)
+		if err != nil {
+			logger.Error("Failed to setup database", zap.Error(err))
+			os.Exit(1)
+		}
+		if err := performHealthCheck(logger, db); err != nil {
+			logger.Error("Health check failed", zap.Error(err))
+			os.Exit(1)
+		}
+		logger.Info("Health check passed")
+		os.Exit(0)
+	}
+
+	registry := setupRegistry()
+	licenseStatus := setupLicense(logger, registry)
+
+	if err := validateFlags(licenseStatus, logger); err != nil {
+		logger.Fatal(err.Error(), zap.Error(err))
+	}
+
+	oidcProvider, cookieCodec, err := setupOIDC(logger, licenseStatus)
+	if err != nil {
+		logger.Fatal("failed to initialize OIDC provider", zap.Error(err))
+	}
+
+	apiTokens, err := resolveAPITokens()
+	if err != nil {
+		logger.Fatal(err.Error(), zap.Error(err))
+	}
+	if len(apiTokens) > 0 {
+		names := make([]string, len(apiTokens))
+		for i, t := range apiTokens {
+			names[i] = t.Name
+		}
+		logger.Info("API token authentication enabled", zap.Strings("tokens", names))
+	}
+
+	auditLogger, err := setupAuditLogger(logger)
+	if err != nil {
+		logger.Fatal("failed to initialize audit logger", zap.Error(err))
+	}
+
+	webhooks, err := setupWebhooks(logger, registry)
+	if err != nil {
+		logger.Fatal("failed to initialize webhook notifier", zap.Error(err))
+	}
+
+	maxFileSize, err := resolveMaxFileSize(logger, licenseStatus.CurrentlyValid())
+	if err != nil {
+		logger.Fatal(err.Error(), zap.Error(err))
+	}
+
 	db, err := setupDatabase(logger)
 	if err != nil {
 		logger.Fatal("failed to setup database", zap.Error(err))
 	}
-	registry := setupRegistry()
+	// Expired files still need cleanup when uploads are disabled.
+	fileStore, err := setupFileStore(logger, db)
+	if err != nil {
+		logger.Fatal("failed to setup file store", zap.Error(err))
+	}
+	var uploadStore server.FileStore
+	if !viper.GetBool("disable-upload") {
+		uploadStore = fileStore
+
+		// Warn if max-length exceeds DB backend limits without a dedicated file store
+		if _, isDBStore := fileStore.(*server.DatabaseFileStore); isDBStore {
+			const memcachedLimit int64 = 1 * 1024 * 1024 // 1MB default memcached item limit
+			if maxFileSize > memcachedLimit {
+				logger.Warn("max-file-size exceeds typical database backend limits without a file store configured",
+					zap.String("max-file-size", server.FormatSize(maxFileSize)),
+					zap.String("db-limit", server.FormatSize(memcachedLimit)),
+					zap.String("hint", "consider using --file-store disk or --file-store s3 for large file support"),
+				)
+			}
+		}
+	}
 
 	cert := viper.GetString("tls-cert")
 	key := viper.GetString("tls-key")
 	quit := make(chan os.Signal, 1)
 
+	defaultOneTimeSecrets := viper.GetBool("default-onetime-secrets")
 	y := server.Server{
-		DB:                  db,
-		MaxLength:           viper.GetInt("max-length"),
-		Registry:            registry,
-		ForceOneTimeSecrets: viper.GetBool("force-onetime-secrets"),
-		AssetPath:           viper.GetString("asset-path"),
-		Logger:              logger,
+		DB:                    db,
+		FileStore:             uploadStore,
+		MaxLength:             viper.GetInt("max-length"),
+		MaxFileSize:           maxFileSize,
+		Registry:              registry,
+		ForceOneTimeSecrets:   viper.GetBool("force-onetime-secrets"),
+		DefaultOneTimeSecrets: &defaultOneTimeSecrets,
+		DefaultReadReceipt:    viper.GetBool("default-read-receipt"),
+		AssetPath:             viper.GetString("asset-path"),
+		Logger:                logger,
+		TrustedProxies:        getStringSliceCSV("trusted-proxies"),
+		Version:               version,
+		License:               licenseStatus,
+		OIDCProvider:          oidcProvider,
+		CookieCodec:           cookieCodec,
+		Audit:                 auditLogger,
+		Webhooks:              webhooks,
+		FileTransferTimeout:   effectiveFileTransferTimeout(),
+
+		Argon2:                viper.GetBool("argon2"),
+		ReadOnly:              viper.GetBool("read-only"),
+		DisableUpload:         viper.GetBool("disable-upload"),
+		PrefetchSecret:        viper.GetBool("prefetch-secret"),
+		DisableFeatures:       viper.GetBool("disable-features"),
+		DisableOneClickLink:   viper.GetBool("disable-one-click-link"),
+		NoLanguageSwitcher:    viper.GetBool("no-language-switcher"),
+		NoThemeSwitcher:       viper.GetBool("no-theme-switcher"),
+		DisableSecretRequests: viper.GetBool("disable-secret-requests"),
+		DisableReadReceipts:   viper.GetBool("disable-read-receipts"),
+
+		RequireAuth:          viper.GetBool("require-auth"),
+		AllowUnverifiedEmail: !viper.GetBool("oidc-require-verified-email"),
+		AllowedEmailDomains:  getStringSliceCSV("oidc-allowed-domains"),
+		APITokens:            apiTokens,
+
+		CORSAllowOrigin:  viper.GetString("cors-allow-origin"),
+		FrontendURL:      viper.GetString("frontend-url"),
+		PrivacyNoticeURL: viper.GetString("privacy-notice-url"),
+		ImprintURL:       viper.GetString("imprint-url"),
+		PublicURL:        viper.GetString("public-url"),
+		LogoURL:          viper.GetString("logo-url"),
+
+		AppName:          viper.GetString("app-name"),
+		HideAppName:      viper.GetBool("hide-app-name"),
+		ThemeLight:       viper.GetString("theme-light"),
+		ThemeDark:        viper.GetString("theme-dark"),
+		ThemeCustomLight: viper.GetString("theme-custom-light"),
+		ThemeCustomDark:  viper.GetString("theme-custom-dark"),
+
+		AllowCustomExpiration: viper.GetBool("allow-custom-expiration"),
+		MinExpiration:         expirationSeconds(viper.GetString("min-expiration")),
+		MaxExpiration:         expirationSeconds(viper.GetString("max-expiration")),
+		DefaultExpiry:         viper.GetString("default-expiry"),
+		ForceExpiration:       viper.GetString("force-expiration"),
 	}
-	yopassSrv := &http.Server{
-		Addr:      fmt.Sprintf("%s:%d", viper.GetString("address"), viper.GetInt("port")),
-		Handler:   y.HTTPHandler(),
-		TLSConfig: &tls.Config{MinVersion: tls.VersionTLS12},
+	// Start cleanup goroutine for file store (disk or S3)
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	defer cleanupCancel()
+	// Business feature gates re-check the expiry timestamp on every request,
+	// so an expired license degrades the server without a restart; this
+	// monitor only makes that visible in the logs.
+	if licenseStatus.Valid {
+		go server.StartLicenseExpiryMonitor(cleanupCtx, licenseStatus, time.Hour, logger)
 	}
+	startFileCleanup(cleanupCtx, fileStore, logger)
+
+	yopassSrv := newApplicationServer(
+		fmt.Sprintf("%s:%d", viper.GetString("address"), viper.GetInt("port")),
+		y.HTTPHandler(),
+	)
 	go func() {
 		logger.Info("Starting yopass server", zap.String("address", yopassSrv.Addr))
 		logger.Info("Loading assets from: ", zap.String("asset-path", y.AssetPath))
@@ -83,10 +185,10 @@ func main() {
 		}
 	}()
 
-	metricsServer := &http.Server{
-		Addr:    fmt.Sprintf("%s:%d", viper.GetString("address"), viper.GetInt("metrics-port")),
-		Handler: metricsHandler(registry),
-	}
+	metricsServer := newMetricsServer(
+		fmt.Sprintf("%s:%d", viper.GetString("address"), viper.GetInt("metrics-port")),
+		metricsHandler(registry),
+	)
 	if port := viper.GetInt("metrics-port"); port > 0 {
 		go func() {
 			logger.Info("Starting yopass metrics server", zap.String("address", metricsServer.Addr))
@@ -98,8 +200,8 @@ func main() {
 	}
 
 	signal.Notify(quit, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
-	signal := <-quit
-	log.Printf("Shutting down HTTP server %s", signal)
+	sig := <-quit
+	logger.Info("Shutting down HTTP server", zap.String("signal", sig.String()))
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	if err := yopassSrv.Shutdown(ctx); err != nil {
@@ -110,62 +212,73 @@ func main() {
 			logger.Fatal("shutdown error: %s", zap.Error(err))
 		}
 	}
+	if webhooks != nil {
+		webhooks.Stop()
+	}
+	if err := auditLogger.Sync(); err != nil {
+		logger.Error("failed to flush audit log on shutdown", zap.Error(err))
+	}
 	logger.Info("Server shut down")
 }
 
-// listenAndServe starts a HTTP server on the given addr. It uses TLS if both
-// certFile and keyFile are not empty.
-func listenAndServe(srv *http.Server, certFile string, keyFile string) error {
-	if certFile == "" || keyFile == "" {
-		return srv.ListenAndServe()
+func effectiveFileTransferTimeout() time.Duration {
+	if timeout := viper.GetDuration("file-transfer-timeout"); timeout != 0 {
+		return timeout
 	}
-	return srv.ListenAndServeTLS(certFile, keyFile)
+	return viper.GetDuration("request-timeout")
 }
 
-// metricsHandler builds a handler to serve Prometheus metrics
-func metricsHandler(r *prometheus.Registry) http.Handler {
-	mx := http.NewServeMux()
-	mx.Handle("/metrics", promhttp.HandlerFor(r, promhttp.HandlerOpts{EnableOpenMetrics: true}))
-	return mx
-}
+// Bound decoded headers per HTTP/2 stream to limit compression amplification.
+const maxHeaderBytes = 16 << 10
 
-func setupRegistry() *prometheus.Registry {
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	registry.MustRegister(collectors.NewGoCollector())
-	return registry
-}
+// Stream deadlines cannot unblock HTTP/2's connection writer if the peer
+// stops reading. Keep this progress limit even when request timeouts are off.
+const http2WriteByteTimeout = 30 * time.Second
 
-// configureZapLogger uses the `log-level` command line argument to set and replace the zap global logger.
-func configureZapLogger() *zap.Logger {
-	loggerCfg := zap.NewProductionConfig()
-	loggerCfg.Level.SetLevel(logLevel)
-
-	logger, err := loggerCfg.Build()
-	if err != nil {
-		log.Fatalf("Unable to build logger %v", err)
+func newMetricsServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		MaxHeaderBytes:    maxHeaderBytes,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		HTTP2:             &http.HTTP2Config{WriteByteTimeout: http2WriteByteTimeout},
 	}
-	zap.ReplaceGlobals(logger)
-	return logger
 }
 
-func setupDatabase(logger *zap.Logger) (server.Database, error) {
-	var db server.Database
-	switch database := viper.GetString("database"); database {
-	case "memcached":
-		memcached := viper.GetString("memcached")
-		db = server.NewMemcached(memcached)
-		logger.Debug("configured Memcached", zap.String("address", memcached))
-	case "redis":
-		redis := viper.GetString("redis")
-		var err error
-		db, err = server.NewRedis(redis)
-		if err != nil {
-			return nil, fmt.Errorf("invalid Redis URL: %w", err)
+func newApplicationServer(addr string, handler http.Handler) *http.Server {
+	requestTimeout := viper.GetDuration("request-timeout")
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS12},
+		MaxHeaderBytes:    maxHeaderBytes,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       requestTimeout,
+		WriteTimeout:      requestTimeout,
+		IdleTimeout:       120 * time.Second,
+		HTTP2:             &http.HTTP2Config{WriteByteTimeout: http2WriteByteTimeout},
+	}
+}
+
+// Flags have already been validated before constructing the server.
+func expirationSeconds(value string) int32 {
+	seconds, _ := yopass.ParseExpirationDuration(value)
+	return seconds
+}
+
+func startFileCleanup(ctx context.Context, fileStore server.FileStore, logger *zap.Logger) {
+	if !viper.GetBool("disable-file-cleanup") {
+		if ds, ok := fileStore.(*server.DiskFileStore); ok {
+			interval := time.Duration(viper.GetInt("cleanup-interval")) * time.Second
+			logger.Info("Starting disk file store cleanup", zap.Duration("interval", interval))
+			go server.StartDiskCleanup(ctx, ds, interval, logger)
+		} else if s3s, ok := fileStore.(*server.S3FileStore); ok {
+			interval := time.Duration(viper.GetInt("cleanup-interval")) * time.Second
+			logger.Info("Starting S3 file store cleanup", zap.Duration("interval", interval))
+			go server.StartS3Cleanup(ctx, s3s, interval, logger)
 		}
-		logger.Debug("configured Redis", zap.String("url", redis))
-	default:
-		return nil, fmt.Errorf("unsupported database, expected 'memcached' or 'redis' got '%s'", database)
 	}
-	return db, nil
 }

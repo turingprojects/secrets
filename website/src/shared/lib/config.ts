@@ -1,0 +1,183 @@
+export interface Config {
+  DISABLE_UPLOAD: boolean;
+  READ_ONLY: boolean;
+  DISABLE_FEATURES: boolean;
+  DISABLE_ONE_CLICK_LINK: boolean;
+  PREFETCH_SECRET: boolean;
+  NO_LANGUAGE_SWITCHER: boolean;
+  NO_THEME_SWITCHER: boolean;
+  FORCE_ONETIME_SECRETS: boolean;
+  DEFAULT_ONETIME_SECRETS: boolean;
+  DEFAULT_READ_RECEIPT: boolean;
+  MAX_FILE_SIZE?: string;
+  MAX_REQUEST_FILE_SIZE?: string;
+  ALLOW_CUSTOM_EXPIRATION: boolean;
+  MIN_EXPIRATION: number;
+  MAX_EXPIRATION: number;
+  DEFAULT_EXPIRY?: number;
+  FORCE_EXPIRATION?: number;
+  PRIVACY_NOTICE_URL?: string;
+  IMPRINT_URL?: string;
+  THEME_LIGHT: string;
+  THEME_DARK: string;
+  THEME_CUSTOM_LIGHT?: Record<string, string>;
+  THEME_CUSTOM_DARK?: Record<string, string>;
+  APP_NAME?: string;
+  HIDE_APP_NAME: boolean;
+  LOGO_URL?: string;
+  PUBLIC_URL?: string;
+  OIDC_ENABLED: boolean;
+  REQUIRE_AUTH: boolean;
+  SECRET_REQUESTS: boolean;
+  SECRET_REQUESTS_DRAINING: boolean;
+  READ_RECEIPTS: boolean;
+  ARGON2: boolean;
+}
+
+export const defaultConfig: Config = {
+  ALLOW_CUSTOM_EXPIRATION: false,
+  MIN_EXPIRATION: 60,
+  MAX_EXPIRATION: 90 * 86400,
+  DISABLE_UPLOAD: false,
+  READ_ONLY: false,
+  DISABLE_FEATURES: true,
+  DISABLE_ONE_CLICK_LINK: false,
+  PREFETCH_SECRET: true,
+  NO_LANGUAGE_SWITCHER: false,
+  NO_THEME_SWITCHER: false,
+  FORCE_ONETIME_SECRETS: false,
+  DEFAULT_ONETIME_SECRETS: true,
+  DEFAULT_READ_RECEIPT: false,
+  THEME_LIGHT: 'emerald',
+  THEME_DARK: 'dim',
+  HIDE_APP_NAME: false,
+  OIDC_ENABLED: false,
+  REQUIRE_AUTH: false,
+  SECRET_REQUESTS: false,
+  SECRET_REQUESTS_DRAINING: false,
+  READ_RECEIPTS: false,
+  ARGON2: false,
+};
+
+// Type-coercion helpers for the untrusted /config response: each returns the
+// value only when it has the expected shape, otherwise the fallback.
+function asBool(value: unknown, fallback: boolean): boolean {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+// asThemeVars coerces an untrusted /config value into a map of CSS custom
+// properties. Only string entries whose key is a `--`-prefixed custom property
+// are kept, and neither key nor value may contain characters that could break
+// out of the injected style rule, so a hostile /config cannot inject CSS.
+function asThemeVars(value: unknown): Record<string, string> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  const unsafe = /[;{}<>]/;
+  const result: Record<string, string> = {};
+  for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+    if (
+      key.startsWith('--') &&
+      !unsafe.test(key) &&
+      typeof val === 'string' &&
+      !unsafe.test(val)
+    ) {
+      result[key] = val;
+    }
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function asExpiration(value: unknown): number | undefined {
+  return typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value > 0 &&
+    value <= 2147483647
+    ? value
+    : undefined;
+}
+
+export function parseConfig(value: unknown): Config {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('Invalid config response format');
+  }
+  const data = value as Record<string, unknown>;
+  const allowCustom = asBool(data.ALLOW_CUSTOM_EXPIRATION, false);
+  const min = asExpiration(data.MIN_EXPIRATION) ?? defaultConfig.MIN_EXPIRATION;
+  const max = asExpiration(data.MAX_EXPIRATION) ?? defaultConfig.MAX_EXPIRATION;
+  if (min > max) throw new Error('Invalid expiration bounds');
+  function policyExpiration(value: unknown): number | undefined {
+    const seconds = asExpiration(value);
+    if (seconds === undefined) return undefined;
+    return allowCustom
+      ? seconds >= min && seconds <= max
+        ? seconds
+        : undefined
+      : [3600, 86400, 604800].includes(seconds)
+        ? seconds
+        : undefined;
+  }
+  return {
+    ALLOW_CUSTOM_EXPIRATION: allowCustom,
+    MIN_EXPIRATION: min,
+    MAX_EXPIRATION: max,
+    DISABLE_UPLOAD: asBool(data.DISABLE_UPLOAD, defaultConfig.DISABLE_UPLOAD),
+    READ_ONLY: asBool(data.READ_ONLY, defaultConfig.READ_ONLY),
+    DISABLE_FEATURES: asBool(
+      data.DISABLE_FEATURES,
+      defaultConfig.DISABLE_FEATURES,
+    ),
+    DISABLE_ONE_CLICK_LINK: asBool(
+      data.DISABLE_ONE_CLICK_LINK,
+      defaultConfig.DISABLE_ONE_CLICK_LINK,
+    ),
+    PREFETCH_SECRET: asBool(
+      data.PREFETCH_SECRET,
+      defaultConfig.PREFETCH_SECRET,
+    ),
+    NO_LANGUAGE_SWITCHER: asBool(
+      data.NO_LANGUAGE_SWITCHER,
+      defaultConfig.NO_LANGUAGE_SWITCHER,
+    ),
+    NO_THEME_SWITCHER: asBool(
+      data.NO_THEME_SWITCHER,
+      defaultConfig.NO_THEME_SWITCHER,
+    ),
+    FORCE_ONETIME_SECRETS: asBool(
+      data.FORCE_ONETIME_SECRETS,
+      defaultConfig.FORCE_ONETIME_SECRETS,
+    ),
+    DEFAULT_ONETIME_SECRETS: asBool(
+      data.DEFAULT_ONETIME_SECRETS,
+      defaultConfig.DEFAULT_ONETIME_SECRETS,
+    ),
+    DEFAULT_READ_RECEIPT: asBool(
+      data.DEFAULT_READ_RECEIPT,
+      defaultConfig.DEFAULT_READ_RECEIPT,
+    ),
+    MAX_FILE_SIZE: asString(data.MAX_FILE_SIZE),
+    MAX_REQUEST_FILE_SIZE: asString(data.MAX_REQUEST_FILE_SIZE),
+    DEFAULT_EXPIRY: policyExpiration(data.DEFAULT_EXPIRY),
+    FORCE_EXPIRATION: policyExpiration(data.FORCE_EXPIRATION),
+    PRIVACY_NOTICE_URL: asString(data.PRIVACY_NOTICE_URL),
+    IMPRINT_URL: asString(data.IMPRINT_URL),
+    THEME_LIGHT: asString(data.THEME_LIGHT) ?? defaultConfig.THEME_LIGHT,
+    THEME_DARK: asString(data.THEME_DARK) ?? defaultConfig.THEME_DARK,
+    THEME_CUSTOM_LIGHT: asThemeVars(data.THEME_CUSTOM_LIGHT),
+    THEME_CUSTOM_DARK: asThemeVars(data.THEME_CUSTOM_DARK),
+    APP_NAME: asString(data.APP_NAME),
+    HIDE_APP_NAME: asBool(data.HIDE_APP_NAME, defaultConfig.HIDE_APP_NAME),
+    LOGO_URL: asString(data.LOGO_URL),
+    PUBLIC_URL: asString(data.PUBLIC_URL),
+    OIDC_ENABLED: asBool(data.OIDC_ENABLED, false),
+    REQUIRE_AUTH: asBool(data.REQUIRE_AUTH, false),
+    SECRET_REQUESTS: asBool(data.SECRET_REQUESTS, false),
+    SECRET_REQUESTS_DRAINING: asBool(data.SECRET_REQUESTS_DRAINING, false),
+    READ_RECEIPTS: asBool(data.READ_RECEIPTS, false),
+    ARGON2: asBool(data.ARGON2, false),
+  };
+}

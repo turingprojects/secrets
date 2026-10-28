@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/jhaals/yopass/pkg/yopass"
@@ -46,6 +49,7 @@ func init() {
 	// Use build-time values if set; otherwise, fall back to hardcoded defaults.
 	// Build with -ldflags "-X main.defaultAPI=https://your-custom-api.com -X main.defaultURL=https://your-custom-url.com" to override defaults
 	viper.SetDefault("api", defaultAPI)
+	viper.SetDefault("api-token", "")
 	viper.SetDefault("url", defaultURL)
 	viper.SetDefault("one-time", true)
 	viper.SetDefault("expiration", "1h")
@@ -68,13 +72,17 @@ func init() {
 	// Command-line flags
 	pflag.CommandLine = pflag.NewFlagSet(os.Args[0], pflag.ContinueOnError)
 	pflag.String("api", viper.GetString("api"), "Yopass API server location")
+	pflag.String("api-token", viper.GetString("api-token"), "API token for server authentication")
 	pflag.String("decrypt", viper.GetString("decrypt"), "Decrypt secret URL")
-	pflag.String("expiration", viper.GetString("expiration"), "Duration after which secret will be deleted [1h, 1d, 1w]")
+	pflag.String("expiration", viper.GetString("expiration"), "Duration after which secret will be deleted (e.g. 1h, 1d, 1w, 90d; custom durations require server support)")
 	pflag.String("file", viper.GetString("file"), "Read secret from file instead of stdin")
 	pflag.String("key", viper.GetString("key"), "Manual encryption/decryption key")
 	pflag.Bool("one-time", viper.GetBool("one-time"), "One-time download")
 	pflag.String("url", viper.GetString("url"), "Yopass public URL")
-	viper.BindPFlags(pflag.CommandLine)
+	if err := viper.BindPFlags(pflag.CommandLine); err != nil {
+		fmt.Fprintln(os.Stderr, "Unable to bind flags:", err)
+		os.Exit(3)
+	}
 }
 
 func main() {
@@ -96,11 +104,11 @@ func main() {
 }
 
 func decrypt(out io.Writer) error {
-	if !strings.HasPrefix(viper.GetString("decrypt"), viper.GetString("url")) {
+	if !matchesPublicURL(viper.GetString("decrypt"), viper.GetString("url")) {
 		return fmt.Errorf("Unconfigured yopass decrypt URL, set --api and --url")
 	}
 
-	id, key, _, keyOpt, err := yopass.ParseURL(viper.GetString("decrypt"))
+	id, key, fileOpt, keyOpt, err := yopass.ParseURL(viper.GetString("decrypt"))
 	if err != nil {
 		return fmt.Errorf("Invalid yopass decrypt URL: %w", err)
 	}
@@ -112,7 +120,11 @@ func decrypt(out io.Writer) error {
 		key = viper.GetString("key")
 	}
 
-	msg, err := yopass.Fetch(viper.GetString("api"), id)
+	if fileOpt {
+		return decryptFile(out, id, key)
+	}
+
+	msg, err := yopass.FetchWithToken(viper.GetString("api"), id, viper.GetString("api-token"))
 	if err != nil {
 		return fmt.Errorf("Failed to fetch secret: %w", err)
 	}
@@ -122,9 +134,21 @@ func decrypt(out io.Writer) error {
 		return fmt.Errorf("Failed to decrypt secret: %w", err)
 	}
 
-	// Note yopass decrypt currently always prints the content to stdout. This
-	// could be changed to create a file, but will need to handle the case that
-	// the file already exists.
+	_, err = fmt.Fprint(out, pt)
+	return err
+}
+
+func decryptFile(out io.Writer, id, key string) error {
+	data, err := yopass.FetchFileWithToken(viper.GetString("api"), id, viper.GetString("api-token"))
+	if err != nil {
+		return fmt.Errorf("Failed to fetch file: %w", err)
+	}
+
+	pt, _, err := yopass.Decrypt(bytes.NewReader(data), key)
+	if err != nil {
+		return fmt.Errorf("Failed to decrypt file: %w", err)
+	}
+
 	_, err = fmt.Fprint(out, pt)
 	return err
 }
@@ -137,12 +161,39 @@ func encryptStdinOrFile(in *os.File, out io.Writer) error {
 }
 
 func encryptFileByName(filename string, out io.Writer) error {
-	var in, err = os.Open(filename)
-	defer in.Close()
+	in, err := os.Open(filename)
 	if err != nil {
 		return fmt.Errorf("Failed to open file: %w", err)
 	}
-	return encrypt(in, out)
+	defer in.Close()
+
+	exp, key, err := encryptionOptions()
+	if err != nil {
+		return err
+	}
+
+	stat, err := in.Stat()
+	if err != nil {
+		return fmt.Errorf("Failed to get file info: %w", err)
+	}
+
+	encryptBinary := yopass.EncryptBinary
+	if argon2Enabled() {
+		encryptBinary = yopass.EncryptBinaryWithArgon2
+	}
+	data, err := encryptBinary(in, key, stat.Name())
+	if err != nil {
+		return fmt.Errorf("Failed to encrypt file: %w", err)
+	}
+
+	id, err := yopass.StoreFileWithToken(viper.GetString("api"), data, exp, viper.GetBool("one-time"), viper.GetString("api-token"))
+	if err != nil {
+		return fmt.Errorf("Failed to store file: %w", err)
+	}
+
+	url := viper.GetString("url")
+	_, err = fmt.Fprintln(out, yopass.SecretURL(url, id, key, true, viper.IsSet("key")))
+	return err
 }
 
 func encryptStdin(in *os.File, out io.Writer) error {
@@ -156,27 +207,26 @@ func encryptStdin(in *os.File, out io.Writer) error {
 	return encrypt(in, out)
 }
 
-func encrypt(in io.ReadCloser, out io.Writer) error {
-	exp := expiration(viper.GetString("expiration"))
-	if exp == 0 {
-		return fmt.Errorf("Expiration can only be 1 hour (1h), 1 day (1d), or 1 week (1w)")
-	}
-
-	key, err := encryptionKey(viper.GetString("key"))
+func encrypt(in io.Reader, out io.Writer) error {
+	exp, key, err := encryptionOptions()
 	if err != nil {
-		return fmt.Errorf("Failed to generate encryption key: %w", err)
+		return err
 	}
 
-	msg, err := yopass.Encrypt(in, key)
+	encryptMessage := yopass.Encrypt
+	if argon2Enabled() {
+		encryptMessage = yopass.EncryptWithArgon2
+	}
+	msg, err := encryptMessage(in, key)
 	if err != nil {
 		return fmt.Errorf("Failed to encrypt secret: %w", err)
 	}
 
-	id, err := yopass.Store(viper.GetString("api"), yopass.Secret{
+	id, err := yopass.StoreWithToken(viper.GetString("api"), yopass.Secret{
 		Expiration: exp,
 		Message:    msg,
 		OneTime:    viper.GetBool("one-time"),
-	})
+	}, viper.GetString("api-token"))
 	if err != nil {
 		return fmt.Errorf("Failed to store secret: %w", err)
 	}
@@ -186,6 +236,16 @@ func encrypt(in io.ReadCloser, out io.Writer) error {
 	return err
 }
 
+// argon2Enabled reads the server /config endpoint and reports whether the
+// server has Argon2 key derivation enabled (--argon2). Errors are ignored
+// on purpose: if the config cannot be fetched the CLI falls back to the
+// default key derivation, which every yopass server accepts. Decryption
+// needs no configuration since the S2K type is stored in the message.
+func argon2Enabled() bool {
+	config, err := yopass.FetchServerConfigWithToken(viper.GetString("api"), viper.GetString("api-token"))
+	return err == nil && config.Argon2
+}
+
 func encryptionKey(key string) (string, error) {
 	if key != "" {
 		return key, nil
@@ -193,17 +253,14 @@ func encryptionKey(key string) (string, error) {
 	return yopass.GenerateKey()
 }
 
+// expiration converts a human-readable expiry duration to seconds, returning
+// 0 for unsupported values.
 func expiration(s string) int32 {
-	switch s {
-	case "1h":
-		return 3600
-	case "1d":
-		return 3600 * 24
-	case "1w":
-		return 3600 * 24 * 7
-	default:
+	seconds, ok := yopass.ParseExpirationDuration(s)
+	if !ok {
 		return 0
 	}
+	return seconds
 }
 
 func parse(args []string, stderr io.Writer) int {
@@ -224,4 +281,38 @@ func parse(args []string, stderr io.Writer) int {
 		return 1
 	}
 	return -1
+}
+
+// encryptionOptions validates the lifetime before generating a key or contacting the server.
+func encryptionOptions() (int32, string, error) {
+	if value := viper.Get("one-time"); value != nil {
+		if _, err := strconv.ParseBool(fmt.Sprint(value)); err != nil {
+			return 0, "", fmt.Errorf("invalid --one-time: expected true or false")
+		}
+	}
+	exp := expiration(viper.GetString("expiration"))
+	if exp == 0 {
+		return 0, "", fmt.Errorf("Expiration must be a positive integer duration using s, m, h, d, or w (e.g. 1h or 90d)")
+	}
+	key, err := encryptionKey(viper.GetString("key"))
+	if err != nil {
+		return 0, "", fmt.Errorf("Failed to generate encryption key: %w", err)
+	}
+	return exp, key, nil
+}
+
+// matchesPublicURL compares URL components so a lookalike host or path prefix
+// cannot pass as the configured public instance.
+func matchesPublicURL(raw, configured string) bool {
+	link, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return false
+	}
+	base, err := url.Parse(configured)
+	if err != nil || base.Host == "" || link.User != nil {
+		return false
+	}
+	return strings.EqualFold(link.Scheme, base.Scheme) &&
+		strings.EqualFold(link.Host, base.Host) &&
+		strings.TrimRight(link.Path, "/") == strings.TrimRight(base.Path, "/")
 }

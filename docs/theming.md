@@ -1,0 +1,175 @@
+---
+title: Theming & Branding
+sidebar_position: 9
+description: Customize the Yopass UI with your own logo, colors, and app name. License required.
+---
+
+# Theming & Custom Branding
+
+Yopass supports custom themes and branding via server flags. All theming and branding features require a valid `--license-key`.
+
+---
+
+## Application name
+
+Replace "Yopass" with your own product name in the UI header and browser tab:
+
+```bash
+yopass-server --app-name "Acme Secrets" --license-key "your-license-key"
+```
+
+For a logo-only navbar, set `--hide-app-name` (or `HIDE_APP_NAME=true`).
+The logo remains visible, using the default Yopass icon if no custom logo is set.
+`--app-name` still sets the browser tab title and the logo's accessible name:
+
+```bash
+yopass-server \
+  --license-key "your-license-key" \
+  --logo-url "/mylogo.svg" \
+  --app-name "Acme Secrets" \
+  --hide-app-name
+```
+
+---
+
+## Themes
+
+Yopass uses [DaisyUI](https://daisyui.com/docs/themes/) for its UI. You can switch to any built-in DaisyUI theme or define a fully custom one.
+
+### Built-in themes
+
+Set the light and dark themes independently. The browser's `prefers-color-scheme` media query determines which is active.
+
+```bash
+yopass-server \
+  --license-key   "your-license-key" \
+  --theme-light   "corporate" \
+  --theme-dark    "business"
+```
+
+Defaults are `emerald` (light) and `dim` (dark).
+
+To hide the theme switch and keep a fixed appearance, set `--no-theme-switcher`
+(or `NO_THEME_SWITCHER=true`). This always uses `THEME_LIGHT` and
+`THEME_CUSTOM_LIGHT`, ignoring browser and saved dark-mode preferences.
+Hiding the switch does not require a license; customizing the theme still does.
+
+Available built-in theme names: `light`, `dark`, `cupcake`, `bumblebee`, `emerald`, `corporate`, `synthwave`, `retro`, `cyberpunk`, `valentine`, `halloween`, `garden`, `forest`, `aqua`, `lofi`, `pastel`, `fantasy`, `wireframe`, `black`, `luxury`, `dracula`, `cmyk`, `autumn`, `business`, `acid`, `lemonade`, `night`, `coffee`, `winter`, `dim`, `nord`, `sunset`.
+
+### Custom themes
+
+Provide a JSON object of CSS variables to override specific design tokens for each color scheme. Keys must start with `--`, and neither keys nor values may contain `; { } < >`. Only `--color-*` variables (the DaisyUI design tokens) are officially supported — see the note below.
+
+```bash
+yopass-server \
+  --license-key         "your-license-key" \
+  --theme-custom-light  '{"--color-primary":"oklch(55% 0.2 250)","--color-secondary":"oklch(70% 0.15 180)"}' \
+  --theme-custom-dark   '{"--color-primary":"oklch(65% 0.25 260)","--color-secondary":"oklch(60% 0.18 190)"}'
+```
+
+The custom theme values are injected as CSS variables on the `<html>` element and override whatever `--theme-light` / `--theme-dark` provides. You can therefore mix a built-in base theme with a handful of overrides:
+
+```bash
+yopass-server \
+  --license-key        "your-license-key" \
+  --theme-light        "corporate" \
+  --theme-custom-light '{"--color-primary":"oklch(50% 0.22 142)"}'
+```
+
+All `--color-*` values must use the `oklch(...)` color format, which is what DaisyUI 4 expects. Other variable types (e.g. `--container-*`) use whatever unit is appropriate for that property, such as `rem`.
+
+Use the [DaisyUI theme generator](https://daisyui.com/theme-generator/) to interactively build and preview a custom theme, then copy the resulting CSS variable values and pass them as a JSON object to the `--theme-custom-light` or `--theme-custom-dark` flags.
+
+---
+
+## Logo
+
+Yopass displays a logo in the navbar and browser tab. You can replace the default Yopass logo with your own image. Logo configuration requires a valid `--license-key`.
+
+### Using a custom logo (`--logo-url`)
+
+Provide a URL the browser can reach directly. This can be an absolute path under the frontend's static files or a full external URL:
+
+```bash
+yopass-server \
+  --license-key "your-license-key" \
+  --logo-url    "/mylogo.png"
+```
+
+In Docker, copy the file into the frontend's public directory so the path resolves:
+
+```dockerfile
+FROM jhaals/yopass:latest
+COPY mylogo.png /public/mylogo.png
+```
+
+```bash
+docker build -t yopass-custom .
+docker run -p 1337:1337 yopass-custom \
+  --license-key your-license-key \
+  --logo-url /mylogo.png
+```
+
+### Image requirements
+
+- **Format**: SVG (recommended) or PNG / JPEG / WebP
+- **Shape**: Square — the image is displayed at 32×32 px in the navbar
+- **Resolution**: For raster images, at least 64×64 px (covers standard and 2× Retina displays)
+- **File size**: Keep below 100 KB — the logo is fetched on every page load
+
+### External URLs and CSP
+
+When `--logo-url` is set to an absolute URL (e.g. `https://cdn.example.com/logo.svg`), the
+server automatically adds that origin to the `img-src` Content Security Policy directive.
+No manual CSP configuration is required.
+
+Relative paths (e.g. `/mylogo.png`) are served from the same origin and require no CSP change.
+
+---
+
+## Environment variables
+
+All flags can be set via environment variables (uppercase, dashes replaced with underscores):
+
+| Flag | Environment variable |
+|------|----------------------|
+| `--license-key` | `LICENSE_KEY` |
+| `--app-name` | `APP_NAME` |
+| `--hide-app-name` | `HIDE_APP_NAME` |
+| `--theme-light` | `THEME_LIGHT` |
+| `--theme-dark` | `THEME_DARK` |
+| `--theme-custom-light` | `THEME_CUSTOM_LIGHT` |
+| `--theme-custom-dark` | `THEME_CUSTOM_DARK` |
+| `--logo-url` | `LOGO_URL` |
+
+---
+
+## Docker Compose example
+
+```yaml
+services:
+  yopass:
+    image: jhaals/yopass:latest
+    ports:
+      - "1337:1337"
+    environment:
+      MEMCACHED: memcached:11211
+      LICENSE_KEY: your-license-key
+      APP_NAME: Acme Secrets
+      THEME_LIGHT: corporate
+      THEME_DARK: business
+      THEME_CUSTOM_LIGHT: '{"--color-primary":"oklch(55% 0.2 250)"}'
+      LOGO_URL: /mylogo.svg
+    depends_on:
+      - memcached
+
+  memcached:
+    image: memcached
+```
+
+---
+
+## Notes
+
+- Custom theme variable keys must start with `--`, and keys/values must not contain `; { } < >`; entries that violate either rule are rejected at startup. Only `--color-*` variables (the DaisyUI design tokens) are officially supported; other CSS custom properties (e.g. `--container-*`, `--spacing-*`) are passed through as-is with no guarantees — they may stop working at any point if Tailwind CSS or DaisyUI rename or remove them in a future release.
+- When any branding flag is set without a `--license-key`, the server starts but the customisation is not applied.

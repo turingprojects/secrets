@@ -1,0 +1,720 @@
+package server
+
+import (
+	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"testing/synctest"
+	"time"
+
+	"github.com/jhaals/yopass/pkg/yopass"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
+	"go.uber.org/zap/zaptest/observer"
+)
+
+// webhookSink is a test receiver collecting webhook deliveries.
+type webhookSink struct {
+	server   *httptest.Server
+	client   *http.Client
+	events   chan capturedDelivery
+	failures atomic.Int32 // number of requests to reject with 500 before succeeding
+}
+
+type capturedDelivery struct {
+	event     WebhookEvent
+	body      []byte
+	signature string
+	eventName string
+	delivery  string
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+func newWebhookSink(t *testing.T) *webhookSink {
+	t.Helper()
+	sink := &webhookSink{events: make(chan capturedDelivery, 16)}
+	sink.server = httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read webhook body: %v", err)
+		}
+		if sink.failures.Add(-1) >= 0 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		var e WebhookEvent
+		if err := json.Unmarshal(body, &e); err != nil {
+			t.Errorf("invalid webhook payload %q: %v", body, err)
+		}
+		sink.events <- capturedDelivery{
+			event:     e,
+			body:      body,
+			signature: r.Header.Get(webhookSignatureHeader),
+			eventName: r.Header.Get("X-Yopass-Event"),
+			delivery:  r.Header.Get("X-Yopass-Delivery"),
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	sink.client = sink.server.Client()
+	return sink
+}
+
+// waitForEvent fails the test unless a delivery arrives within the deadline.
+func (s *webhookSink) waitForEvent(t *testing.T) capturedDelivery {
+	t.Helper()
+	select {
+	case d := <-s.events:
+		return d
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for webhook delivery")
+		return capturedDelivery{}
+	}
+}
+
+// assertNoEvent fails the test if a delivery arrives within the window.
+func (s *webhookSink) assertNoEvent(t *testing.T, window time.Duration) {
+	t.Helper()
+	synctest.Sleep(window)
+	select {
+	case d := <-s.events:
+		t.Fatalf("unexpected webhook delivery: %+v", d.event)
+	default:
+	}
+}
+
+func newTestNotifier(t *testing.T, cfg WebhookConfig, client *http.Client) *WebhookNotifier {
+	t.Helper()
+	if cfg.Backoff == 0 {
+		cfg.Backoff = 10 * time.Millisecond
+	}
+	if cfg.ExpiryInterval == 0 {
+		cfg.ExpiryInterval = 20 * time.Millisecond
+	}
+	n, err := newWebhookNotifier(cfg, zaptest.NewLogger(t), nil, client)
+	if err != nil {
+		t.Fatalf("failed to create notifier: %v", err)
+	}
+	t.Cleanup(n.Stop)
+	return n
+}
+
+func TestWebhookNotifierConfigValidation(t *testing.T) {
+	for _, invalid := range []string{"", "not a url", "ftp://example.com/hook", "/relative"} {
+		if _, err := NewWebhookNotifier(WebhookConfig{URL: invalid}, zaptest.NewLogger(t), nil); err == nil {
+			t.Errorf("expected error for webhook URL %q", invalid)
+		}
+	}
+}
+
+// TestWebhookFailedAttemptDoesNotLogURL verifies a transport failure is
+// logged without the webhook URL, whose user info, path and query may carry
+// the receiver's credentials.
+func TestWebhookFailedAttemptDoesNotLogURL(t *testing.T) {
+	core, logs := observer.New(zap.WarnLevel)
+	failingClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("receiver unavailable")
+	})}
+	n, err := newWebhookNotifier(WebhookConfig{
+		URL: "https://usertoken:hunter2@hooks.example.com/catch/pathtoken?sig=querytoken",
+	}, zap.New(core), nil, failingClient)
+	if err != nil {
+		t.Fatalf("failed to create notifier: %v", err)
+	}
+	t.Cleanup(n.Stop)
+
+	if n.attempt(WebhookEventSecretCreated, "delivery", []byte("{}")) {
+		t.Fatal("expected the attempt to fail")
+	}
+
+	entries := logs.FilterMessage("webhook: delivery attempt failed").All()
+	if len(entries) != 1 {
+		t.Fatalf("expected one failed attempt to be logged, got %d", len(entries))
+	}
+	logged := fmt.Sprint(entries[0].ContextMap())
+	if !strings.Contains(logged, "receiver unavailable") {
+		t.Errorf("expected the cause of the failure to be logged, got %q", logged)
+	}
+	for _, part := range []string{"usertoken", "hunter2", "pathtoken", "querytoken"} {
+		if strings.Contains(logged, part) {
+			t.Errorf("webhook URL part %q leaked in log: %q", part, logged)
+		}
+	}
+}
+
+func TestWebhookSecretLifecycleEvents(t *testing.T) {
+	synctest.Test(t, testWebhookSecretLifecycleEvents)
+}
+
+func testWebhookSecretLifecycleEvents(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL, Secret: "signing-key"}, sink.client)
+
+	db := newMemoryDB()
+	y := Server{
+		DB:        db,
+		MaxLength: 10000,
+		Registry:  prometheus.NewRegistry(),
+		Logger:    zaptest.NewLogger(t),
+		License:   LicenseStatus{Valid: true, ExpiresAt: time.Now().Add(24 * time.Hour)},
+		Webhooks:  notifier,
+	}
+	handler := y.HTTPHandler()
+
+	// Create a one-time secret through the API.
+	encrypted, err := yopass.Encrypt(strings.NewReader("hunter2"), "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]interface{}{
+		"message":    encrypted,
+		"expiration": 3600,
+		"one_time":   true,
+	})
+	req, _ := http.NewRequest("POST", "/create/secret", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("create secret: status %d body %s", rr.Code, rr.Body.String())
+	}
+	var created struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretCreated {
+		t.Fatalf("expected %s, got %s", WebhookEventSecretCreated, d.event.Event)
+	}
+	if d.event.SecretID != redactSecretID(created.Message) {
+		t.Errorf("created event must carry the redacted secret ID, got %q", d.event.SecretID)
+	}
+	if d.event.SecretID == created.Message {
+		t.Error("webhook payload must never contain the raw secret key")
+	}
+	if d.event.Kind != WebhookKindSecret || !d.event.OneTime || d.event.ExpirationSeconds != 3600 {
+		t.Errorf("unexpected created event fields: %+v", d.event)
+	}
+	if d.eventName != WebhookEventSecretCreated {
+		t.Errorf("X-Yopass-Event header: got %q", d.eventName)
+	}
+	if d.delivery == "" || d.event.DeliveryID != d.delivery {
+		t.Error("signed delivery ID missing or does not match header")
+	}
+	if d.event.Timestamp.IsZero() {
+		t.Error("event timestamp not set")
+	}
+
+	// Independently verify compatibility with existing body-only signature verification.
+	mac := hmac.New(sha256.New, []byte("signing-key"))
+	mac.Write(d.body)
+	want := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+	if !hmac.Equal([]byte(d.signature), []byte(want)) {
+		t.Errorf("signature mismatch: got %q want %q", d.signature, want)
+	}
+
+	// Viewing the secret emits a viewed event.
+	req, _ = http.NewRequest("GET", "/secret/"+created.Message, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("get secret: status %d", rr.Code)
+	}
+	d = sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretViewed {
+		t.Fatalf("expected %s, got %s", WebhookEventSecretViewed, d.event.Event)
+	}
+	if d.event.SecretID != redactSecretID(created.Message) || d.event.Kind != WebhookKindSecret {
+		t.Errorf("unexpected viewed event fields: %+v", d.event)
+	}
+
+	// The one-time view cancelled expiry tracking — no expired event fires
+	// even when the deadline is forced into the past.
+	notifier.mu.Lock()
+	if len(notifier.expiries) != 0 {
+		t.Errorf("expiry tracking should be empty after one-time view, got %d entries", len(notifier.expiries))
+	}
+	notifier.mu.Unlock()
+	sink.assertNoEvent(t, 100*time.Millisecond)
+}
+
+func TestWebhookExpiredEvent(t *testing.T) {
+	synctest.Test(t, testWebhookExpiredEvent)
+}
+
+func testWebhookExpiredEvent(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	notifier.SecretCreated("expiring-id", WebhookKindSecret, false, 3600)
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretCreated {
+		t.Fatalf("expected created event, got %s", d.event.Event)
+	}
+
+	// Force the deadline into the past; the watcher tick should pick it up.
+	notifier.mu.Lock()
+	exp := notifier.expiries["expiring-id"]
+	exp.deadline = time.Now().Add(-time.Second)
+	notifier.expiries["expiring-id"] = exp
+	notifier.mu.Unlock()
+
+	d = sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretExpired {
+		t.Fatalf("expected %s, got %s", WebhookEventSecretExpired, d.event.Event)
+	}
+	if d.event.SecretID != redactSecretID("expiring-id") || d.event.ExpirationSeconds != 3600 {
+		t.Errorf("unexpected expired event fields: %+v", d.event)
+	}
+
+	// Expired entries fire exactly once.
+	sink.assertNoEvent(t, 100*time.Millisecond)
+}
+
+func TestWebhookDeleteCancelsExpiry(t *testing.T) {
+	synctest.Test(t, testWebhookDeleteCancelsExpiry)
+}
+
+func testWebhookDeleteCancelsExpiry(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	notifier.SecretCreated("deleted-id", WebhookKindSecret, false, 3600)
+	sink.waitForEvent(t) // created
+
+	notifier.SecretDeleted("deleted-id")
+	notifier.mu.Lock()
+	exp, tracked := notifier.expiries["deleted-id"]
+	notifier.mu.Unlock()
+	if tracked {
+		t.Fatalf("expiry tracking should be cancelled after delete: %+v", exp)
+	}
+	sink.assertNoEvent(t, 100*time.Millisecond)
+}
+
+func TestWebhookNonOneTimeViewKeepsExpiryTracking(t *testing.T) {
+	synctest.Test(t, testWebhookNonOneTimeViewKeepsExpiryTracking)
+}
+
+func testWebhookNonOneTimeViewKeepsExpiryTracking(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	notifier.SecretCreated("multi-view-id", WebhookKindSecret, false, 3600)
+	sink.waitForEvent(t) // created
+	notifier.SecretViewed("multi-view-id", WebhookKindSecret, false)
+	sink.waitForEvent(t) // viewed
+
+	notifier.mu.Lock()
+	_, tracked := notifier.expiries["multi-view-id"]
+	notifier.mu.Unlock()
+	if !tracked {
+		t.Fatal("non-one-time secrets must stay tracked for expiry after a view")
+	}
+}
+
+func TestWebhookRetriesOnFailure(t *testing.T) {
+	synctest.Test(t, testWebhookRetriesOnFailure)
+}
+
+func testWebhookRetriesOnFailure(t *testing.T) {
+	sink := newWebhookSink(t)
+	sink.failures.Store(2) // first two attempts get a 500
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL, MaxAttempts: 3}, sink.client)
+
+	notifier.SecretViewed("retry-id", WebhookKindSecret, true)
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretViewed {
+		t.Fatalf("expected viewed event after retries, got %s", d.event.Event)
+	}
+}
+
+func TestWebhookGivesUpAfterMaxAttempts(t *testing.T) {
+	synctest.Test(t, testWebhookGivesUpAfterMaxAttempts)
+}
+
+func testWebhookGivesUpAfterMaxAttempts(t *testing.T) {
+	sink := newWebhookSink(t)
+	sink.failures.Store(99)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL, MaxAttempts: 2}, sink.client)
+
+	notifier.SecretViewed("failing-id", WebhookKindSecret, true)
+	sink.assertNoEvent(t, 300*time.Millisecond)
+	if remaining := sink.failures.Load(); remaining != 99-2 {
+		t.Errorf("expected exactly 2 delivery attempts, sink saw %d", 99-remaining)
+	}
+}
+
+func TestWebhookFileEvents(t *testing.T) {
+	synctest.Test(t, testWebhookFileEvents)
+}
+
+func testWebhookFileEvents(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	db := newMemoryDB()
+	y := Server{
+		DB:          db,
+		MaxLength:   10000,
+		MaxFileSize: 1024 * 1024,
+		Registry:    prometheus.NewRegistry(),
+		Logger:      zaptest.NewLogger(t),
+		License:     LicenseStatus{Valid: true, ExpiresAt: time.Now().Add(24 * time.Hour)},
+		Webhooks:    notifier,
+	}
+	handler := y.HTTPHandler()
+
+	encrypted, err := yopass.EncryptBinary(strings.NewReader("file content"), "key", "file.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	req, _ := http.NewRequest("POST", "/create/file", bytes.NewReader(encrypted))
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("X-Yopass-Expiration", "3600")
+	req.Header.Set("X-Yopass-OneTime", "true")
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("upload: status %d body %s", rr.Code, rr.Body.String())
+	}
+	var created struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretCreated || d.event.Kind != WebhookKindFile {
+		t.Fatalf("expected created file event, got %+v", d.event)
+	}
+
+	req, _ = http.NewRequest("GET", "/file/"+created.Message, nil)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("download: status %d", rr.Code)
+	}
+	d = sink.waitForEvent(t)
+	if d.event.Event != WebhookEventSecretViewed || d.event.Kind != WebhookKindFile {
+		t.Fatalf("expected viewed file event, got %+v", d.event)
+	}
+}
+
+// TestWebhookRequestLifecycleEvents drives a full secret request through the
+// API and verifies the emitted events: created, fulfilled, and no expired
+// event once the secret has been collected.
+func TestWebhookRequestLifecycleEvents(t *testing.T) {
+	synctest.Test(t, testWebhookRequestLifecycleEvents)
+}
+
+func testWebhookRequestLifecycleEvents(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	y := newRequestTestServer(t, newMemoryDB(), true)
+	y.Webhooks = notifier
+	handler := y.HTTPHandler()
+
+	id, token := createRequest(t, handler, testPublicKey(t), "ticket #4711", 3600)
+
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventRequestCreated {
+		t.Fatalf("expected %s, got %s", WebhookEventRequestCreated, d.event.Event)
+	}
+	if d.event.SecretID != redactSecretID(id) || d.event.Kind != WebhookKindRequest {
+		t.Errorf("unexpected created event fields: %+v", d.event)
+	}
+	if d.event.SecretID == id {
+		t.Error("webhook payload must never contain the raw request ID")
+	}
+	if d.event.ExpirationSeconds != 3600 {
+		t.Errorf("expected expiration 3600, got %d", d.event.ExpirationSeconds)
+	}
+
+	// Viewing the request info (responder opening the link) emits nothing.
+	req, _ := http.NewRequest("GET", "/request/"+id, nil)
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+	sink.assertNoEvent(t, 100*time.Millisecond)
+
+	// Fulfillment emits request.fulfilled and keeps expiry tracking alive.
+	encrypted, err := yopass.Encrypt(strings.NewReader("hunter2"), "key")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fulfillBody, _ := json.Marshal(map[string]string{"message": encrypted})
+	req, _ = http.NewRequest("POST", "/request/"+id+"/secret", bytes.NewReader(fulfillBody))
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("fulfill: status %d", rr.Code)
+	}
+	d = sink.waitForEvent(t)
+	if d.event.Event != WebhookEventRequestFulfilled || d.event.Kind != WebhookKindRequest {
+		t.Fatalf("expected fulfilled event, got %+v", d.event)
+	}
+	notifier.mu.Lock()
+	_, tracked := notifier.expiries[id]
+	notifier.mu.Unlock()
+	if !tracked {
+		t.Fatal("fulfilled requests must stay tracked until collected")
+	}
+
+	// Collecting the secret cancels expiry tracking without an event.
+	req, _ = http.NewRequest("GET", "/request/"+id+"/secret", nil)
+	req.Header.Set(requestTokenHeader, token)
+	rr = httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("collect: status %d", rr.Code)
+	}
+	notifier.mu.Lock()
+	_, tracked = notifier.expiries[id]
+	notifier.mu.Unlock()
+	if tracked {
+		t.Fatal("collected requests must not stay expiry-tracked")
+	}
+	sink.assertNoEvent(t, 100*time.Millisecond)
+}
+
+func TestWebhookRequestRevokeCancelsExpiry(t *testing.T) {
+	synctest.Test(t, testWebhookRequestRevokeCancelsExpiry)
+}
+
+func testWebhookRequestRevokeCancelsExpiry(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	y := newRequestTestServer(t, newMemoryDB(), true)
+	y.Webhooks = notifier
+	handler := y.HTTPHandler()
+
+	id, token := createRequest(t, handler, testPublicKey(t), "", 3600)
+	sink.waitForEvent(t) // created
+
+	req, _ := http.NewRequest("DELETE", "/request/"+id, nil)
+	req.Header.Set(requestTokenHeader, token)
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusNoContent {
+		t.Fatalf("revoke: status %d", rr.Code)
+	}
+
+	notifier.mu.Lock()
+	_, tracked := notifier.expiries[id]
+	notifier.mu.Unlock()
+	if tracked {
+		t.Fatal("revoked requests must not stay expiry-tracked")
+	}
+	sink.assertNoEvent(t, 100*time.Millisecond)
+}
+
+func TestWebhookRequestExpiredEvent(t *testing.T) {
+	synctest.Test(t, testWebhookRequestExpiredEvent)
+}
+
+func testWebhookRequestExpiredEvent(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	notifier.RequestCreated("expiring-request", 3600)
+	d := sink.waitForEvent(t)
+	if d.event.Event != WebhookEventRequestCreated {
+		t.Fatalf("expected created event, got %s", d.event.Event)
+	}
+
+	// Force the deadline into the past; the watcher tick should pick it up.
+	notifier.mu.Lock()
+	exp := notifier.expiries["expiring-request"]
+	exp.deadline = time.Now().Add(-time.Second)
+	notifier.expiries["expiring-request"] = exp
+	notifier.mu.Unlock()
+
+	d = sink.waitForEvent(t)
+	if d.event.Event != WebhookEventRequestExpired {
+		t.Fatalf("expected %s, got %s", WebhookEventRequestExpired, d.event.Event)
+	}
+	if d.event.Kind != WebhookKindRequest || d.event.ExpirationSeconds != 3600 {
+		t.Errorf("unexpected expired event fields: %+v", d.event)
+	}
+}
+
+func TestWebhookUnsignedDeliveryHasNoSignature(t *testing.T) {
+	synctest.Test(t, testWebhookUnsignedDeliveryHasNoSignature)
+}
+
+func testWebhookUnsignedDeliveryHasNoSignature(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{URL: sink.server.URL}, sink.client)
+
+	notifier.SecretViewed("unsigned-id", WebhookKindSecret, true)
+	d := sink.waitForEvent(t)
+	if d.signature != "" {
+		t.Errorf("expected no signature header without a secret, got %q", d.signature)
+	}
+}
+
+func TestWebhookExpiryTrackerCap(t *testing.T) {
+	synctest.Test(t, testWebhookExpiryTrackerCap)
+}
+
+func testWebhookExpiryTrackerCap(t *testing.T) {
+	sink := newWebhookSink(t)
+	notifier := newTestNotifier(t, WebhookConfig{
+		URL:         sink.server.URL,
+		MaxExpiries: 3,
+	}, sink.client)
+
+	notifier.SecretCreated("a", WebhookKindSecret, false, 3600)
+	notifier.SecretCreated("b", WebhookKindSecret, false, 3600)
+	notifier.SecretCreated("c", WebhookKindSecret, false, 3600)
+	// Drain the created events.
+	for i := 0; i < 3; i++ {
+		sink.waitForEvent(t)
+	}
+
+	notifier.mu.Lock()
+	count := len(notifier.expiries)
+	notifier.mu.Unlock()
+	if count != 3 {
+		t.Fatalf("expected 3 tracked entries, got %d", count)
+	}
+
+	// This one should be dropped — tracker is full.
+	notifier.SecretCreated("d", WebhookKindSecret, false, 3600)
+	sink.waitForEvent(t) // created event still fires
+	notifier.mu.Lock()
+	count = len(notifier.expiries)
+	notifier.mu.Unlock()
+	if count != 3 {
+		t.Fatalf("expected 3 tracked entries after cap, got %d", count)
+	}
+
+	// Updating an existing entry should still work at capacity.
+	notifier.SecretCreated("a", WebhookKindSecret, false, 7200)
+	sink.waitForEvent(t)
+	notifier.mu.Lock()
+	count = len(notifier.expiries)
+	notifier.mu.Unlock()
+	if count != 3 {
+		t.Fatalf("expected 3 tracked entries after update, got %d", count)
+	}
+}
+
+// TestWebhookEnqueueDropsWhenQueueFull verifies enqueue never blocks request
+// handling even when the receiver is unreachable and the buffer fills up.
+func TestWebhookEnqueueDropsWhenQueueFull(t *testing.T) {
+	synctest.Test(t, testWebhookEnqueueDropsWhenQueueFull)
+}
+
+func testWebhookEnqueueDropsWhenQueueFull(t *testing.T) {
+	failingClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("receiver unavailable")
+	})}
+
+	notifier := newTestNotifier(t, WebhookConfig{
+		URL:         "http://example.com",
+		QueueSize:   1,
+		MaxAttempts: 3,
+		Backoff:     time.Second,
+	}, failingClient)
+
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 50; i++ {
+			notifier.SecretViewed(fmt.Sprintf("id-%d", i), WebhookKindSecret, true)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("enqueue blocked with a full queue")
+	}
+}
+
+func TestWebhookSignedBodyCompatibilityAndRetries(t *testing.T) {
+	var deliveries []capturedDelivery
+	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var event WebhookEvent
+		if err := json.Unmarshal(body, &event); err != nil {
+			t.Fatal(err)
+		}
+		deliveries = append(deliveries, capturedDelivery{event: event, body: body, signature: r.Header.Get(webhookSignatureHeader), eventName: r.Header.Get("X-Yopass-Event"), delivery: r.Header.Get("X-Yopass-Delivery")})
+		status := 200
+		if len(deliveries) < 3 {
+			status = 500
+		}
+		return &http.Response{StatusCode: status, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+	})}
+	n := newTestNotifier(t, WebhookConfig{URL: "https://receiver.example/hook", Secret: "key", Backoff: time.Millisecond}, client)
+	event := WebhookEvent{Event: WebhookEventSecretCreated, Timestamp: time.Now().UTC()}
+	n.deliver(event)
+	if len(deliveries) != 3 {
+		t.Fatalf("expected three attempts, got %d", len(deliveries))
+	}
+	first := deliveries[0]
+	for _, d := range deliveries {
+		if d.event.DeliveryID == "" || d.event.DeliveryID != d.delivery || d.event.Event != d.eventName {
+			t.Fatal("body and header metadata differ")
+		}
+		if d.event.DeliveryID != first.event.DeliveryID || !bytes.Equal(d.body, first.body) || d.signature != first.signature {
+			t.Fatal("retry changed signed payload")
+		}
+		mac := hmac.New(sha256.New, []byte("key"))
+		mac.Write(d.body)
+		if d.signature != "sha256="+hex.EncodeToString(mac.Sum(nil)) {
+			t.Fatal("legacy body-only verifier rejected delivery")
+		}
+		// An existing receiver can ignore the new JSON field.
+		var legacy struct {
+			Event     string    `json:"event"`
+			Timestamp time.Time `json:"timestamp"`
+		}
+		if err := json.Unmarshal(d.body, &legacy); err != nil || legacy.Event != event.Event || !legacy.Timestamp.Equal(event.Timestamp) {
+			t.Fatal("legacy JSON decoder rejected delivery")
+		}
+	}
+	for _, field := range []string{"event", "delivery_id", "timestamp"} {
+		var altered map[string]interface{}
+		if err := json.Unmarshal(first.body, &altered); err != nil {
+			t.Fatal(err)
+		}
+		altered[field] = "tampered"
+		body, err := json.Marshal(altered)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mac := hmac.New(sha256.New, []byte("key"))
+		mac.Write(body)
+		if first.signature == "sha256="+hex.EncodeToString(mac.Sum(nil)) {
+			t.Fatalf("tampering with %s preserved signature", field)
+		}
+	}
+	n.deliver(event)
+	if len(deliveries) != 4 || deliveries[3].event.DeliveryID == first.event.DeliveryID {
+		t.Fatal("separate events reused a delivery ID")
+	}
+}

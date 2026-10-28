@@ -1,6 +1,7 @@
 package yopass
 
 import (
+	"bufio"
 	"bytes"
 	"crypto"
 	"crypto/rand"
@@ -9,14 +10,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
+	"math/big"
 	"net/url"
 	"os"
 	"strings"
 
-	"golang.org/x/crypto/openpgp"
-	"golang.org/x/crypto/openpgp/armor"
-	"golang.org/x/crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp"
+	"github.com/ProtonMail/go-crypto/openpgp/armor"
+	"github.com/ProtonMail/go-crypto/openpgp/packet"
+	"github.com/ProtonMail/go-crypto/openpgp/s2k"
 )
 
 // ErrEmptyKey is returned when no encryption key is provided.
@@ -28,31 +30,130 @@ var ErrInvalidKey = errors.New("invalid decryption key")
 // ErrInvalidMessage is returned when a given message is invalid.
 var ErrInvalidMessage = errors.New("invalid message")
 
+var maxDecompressedMessageSize int64 = 1 << 20
+
 var pgpConfig = &packet.Config{
-	DefaultHash:            crypto.SHA256,
-	DefaultCipher:          packet.CipherAES256,
-	DefaultCompressionAlgo: packet.CompressionNone,
+	DefaultHash:                crypto.SHA256,
+	DefaultCipher:              packet.CipherAES256,
+	DefaultCompressionAlgo:     packet.CompressionNone,
+	MaxDecompressedMessageSize: &maxDecompressedMessageSize,
+	AEADConfig:                 &packet.AEADConfig{DefaultMode: packet.AEADModeGCM},
 }
 
 var pgpHeader = map[string]string{
 	"Comment": "https://yopass.se",
 }
 
+// pgpConfigArgon2 mirrors pgpConfig with S2K key derivation switched from
+// the default iterated SHA-256 to memory-hard Argon2id. It is a separate
+// config so the Argon2 choice is made per encryption call and never leaks
+// into unrelated encryption in the same process.
+var pgpConfigArgon2 = func() *packet.Config {
+	cfg := *pgpConfig
+	cfg.S2KConfig = &s2k.Config{S2KMode: s2k.Argon2S2K}
+	return &cfg
+}()
+
+// Default clients use 64 MiB; cap sender-controlled Argon2 memory at 128 MiB.
+const maxArgon2MemoryExp = 17
+
+// boundedS2KReader checks only the packet prefix, without buffering file ciphertext.
+func boundedS2KReader(r io.Reader) (io.Reader, error) {
+	source := bufio.NewReader(r)
+	var prefix bytes.Buffer
+	packets := packet.NewOpaqueReader(io.LimitReader(io.TeeReader(source, &prefix), 64<<10))
+	for {
+		first, err := source.Peek(1)
+		if err != nil {
+			return nil, ErrInvalidMessage
+		}
+		tag := first[0] & 0x3f
+		if first[0]&0x40 == 0 {
+			tag = (first[0] >> 2) & 0x0f
+		}
+		switch tag {
+		case 9, 18, 20:
+			if _, err := packet.Read(io.LimitReader(io.TeeReader(source, &prefix), int64(64<<10-prefix.Len()))); err != nil || prefix.Len() > 64<<10 {
+				return nil, ErrInvalidMessage
+			}
+			return io.MultiReader(bytes.NewReader(prefix.Bytes()), source), nil
+		}
+		p, err := packets.Next()
+		if err != nil {
+			return nil, ErrInvalidMessage
+		}
+		// Semantic parsing must consume the same bytes as opaque framing.
+		var encoded bytes.Buffer
+		if err := p.Serialize(&encoded); err != nil {
+			return nil, ErrInvalidMessage
+		}
+		semantic := bytes.NewReader(encoded.Bytes())
+		if _, err := packet.Read(semantic); err != nil || semantic.Len() != 0 {
+			return nil, ErrInvalidMessage
+		}
+		if p.Tag != 3 || len(p.Contents) == 0 {
+			continue
+		}
+		var offset int
+		switch p.Contents[0] {
+		case 4:
+			offset = 2
+		case 5:
+			offset = 3
+		case 6:
+			offset = 5
+		default:
+			continue
+		}
+		const memoryOffset = 1 + s2k.Argon2SaltSize + 2
+		if len(p.Contents) > offset+memoryOffset && p.Contents[offset] == byte(s2k.Argon2S2K) && p.Contents[offset+memoryOffset] > maxArgon2MemoryExp {
+			return nil, ErrInvalidMessage
+		}
+	}
+}
+
+// expirations is the single source of truth for the supported secret
+// lifetimes, mapping the human-readable form to seconds. pkg/server and the
+// CLI both derive their validation from it.
+var expirations = map[string]int32{
+	"1h": 3600,
+	"1d": 86400,
+	"1w": 604800,
+}
+
+// ExpirationSeconds converts a human-readable expiry duration ("1h", "1d" or
+// "1w") to its equivalent in seconds. ok is false for unsupported values.
+func ExpirationSeconds(s string) (seconds int32, ok bool) {
+	seconds, ok = expirations[s]
+	return seconds, ok
+}
+
+// ValidExpirationSeconds reports whether seconds matches one of the
+// supported secret lifetimes.
+func ValidExpirationSeconds(seconds int32) bool {
+	for _, ttl := range expirations {
+		if ttl == seconds {
+			return true
+		}
+	}
+	return false
+}
+
 // Secret holds the encrypted message
 type Secret struct {
-	Expiration int32  `json:"expiration,omitempty"`
-	Message    string `json:"message"`
-	OneTime    bool   `json:"one_time,omitempty"`
+	Expiration  int32  `json:"expiration,omitempty"`
+	Message     string `json:"message"`
+	OneTime     bool   `json:"one_time,omitempty"`
+	RequireAuth bool   `json:"require_auth,omitempty"`
 }
 
 // ToJSON converts a Secret to json
 func (s *Secret) ToJSON() ([]byte, error) {
-	return json.Marshal(&s)
+	return json.Marshal(s)
 }
 
 // Decrypt reads the provided ciphertext and returns the plaintext decrypted
-// with the given key. The ciphertext format is specified by the yopass
-// frontend, no assumptions about the format should be made.
+// with the given key. It auto-detects armored vs binary PGP format.
 func Decrypt(r io.Reader, key string) (content, filename string, err error) {
 	tried := false
 	prompt := func([]openpgp.Key, bool) ([]byte, error) {
@@ -62,30 +163,104 @@ func Decrypt(r io.Reader, key string) (content, filename string, err error) {
 		tried = true
 		return []byte(key), nil
 	}
-	a, err := armor.Decode(r)
+
+	// Buffer enough to detect the format
+	buf := make([]byte, len(armorHeader))
+	n, readErr := io.ReadFull(r, buf)
+	// Reconstruct a reader with the peeked bytes
+	combined := io.MultiReader(bytes.NewReader(buf[:n]), r)
+
+	var msgReader io.Reader
+	if readErr == nil && string(buf) == armorHeader {
+		// Armored PGP
+		a, err := armor.Decode(combined)
+		if err != nil {
+			return "", "", ErrInvalidMessage
+		}
+		msgReader = a.Body
+	} else {
+		// Binary PGP
+		msgReader = combined
+	}
+
+	checked, err := boundedS2KReader(msgReader)
 	if err != nil {
+		return "", "", err
+	}
+	m, err := openpgp.ReadMessage(checked, nil, prompt, pgpConfig)
+	if err != nil {
+		if errors.Is(err, ErrInvalidKey) {
+			return "", "", fmt.Errorf("could not decrypt: %w", err)
+		}
 		return "", "", ErrInvalidMessage
 	}
-	m, err := openpgp.ReadMessage(a.Body, nil, prompt, pgpConfig)
-	if err != nil {
-		return "", "", fmt.Errorf("could not decrypt: %w", err)
-	}
-	p, err := ioutil.ReadAll(m.UnverifiedBody)
+	p, err := io.ReadAll(m.UnverifiedBody)
 	if err != nil {
 		return "", "", fmt.Errorf("could not read plaintext: %w", err)
 	}
-	// openpgpjs appears to always set a filename. The IsBinary flag is used as
-	// file upload indicator.
 	if m.LiteralData.IsBinary {
 		filename = m.LiteralData.FileName
 	}
 	return string(p), filename, nil
 }
 
+const armorHeader = "-----BEGIN PGP MESSAGE-----"
+
+// EncryptBinary encrypts the data from r as binary PGP (no ASCII armor).
+// This format is used for streaming file uploads.
+func EncryptBinary(r io.Reader, key string, filename string) ([]byte, error) {
+	return encryptBinary(r, key, filename, pgpConfig)
+}
+
+// EncryptBinaryWithArgon2 is EncryptBinary with memory-hard Argon2id key
+// derivation instead of the default iterated SHA-256. Only use it against
+// servers that advertise Argon2 support (see FetchServerConfig). Decryption
+// needs no counterpart as the S2K type is stored in the PGP message itself.
+func EncryptBinaryWithArgon2(r io.Reader, key string, filename string) ([]byte, error) {
+	return encryptBinary(r, key, filename, pgpConfigArgon2)
+}
+
+func encryptBinary(r io.Reader, key string, filename string, config *packet.Config) ([]byte, error) {
+	if key == "" {
+		return nil, ErrEmptyKey
+	}
+
+	hints := &openpgp.FileHints{
+		IsBinary: true,
+		FileName: filename,
+	}
+
+	buf := new(bytes.Buffer)
+	w, err := openpgp.SymmetricallyEncrypt(buf, []byte(key), hints, config)
+	if err != nil {
+		return nil, fmt.Errorf("could not encrypt: %w", err)
+	}
+	if _, err := io.Copy(w, r); err != nil {
+		return nil, fmt.Errorf("could not copy data: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return nil, fmt.Errorf("could not close writer: %w", err)
+	}
+
+	return buf.Bytes(), nil
+}
+
 // Encrypt reads the provided plaintext and returns a ciphertext encrypted with
 // the given key. No assumptions about the ciphertext format should be made, the
 // encryption method might change in future versions.
 func Encrypt(r io.Reader, key string) (string, error) {
+	return encrypt(r, key, pgpConfig)
+}
+
+// EncryptWithArgon2 is Encrypt with memory-hard Argon2id key derivation
+// instead of the default iterated SHA-256. Only use it against servers that
+// advertise Argon2 support (see FetchServerConfig). Decryption needs no
+// counterpart as the S2K type is stored in the PGP message itself.
+func EncryptWithArgon2(r io.Reader, key string) (string, error) {
+	return encrypt(r, key, pgpConfigArgon2)
+}
+
+func encrypt(r io.Reader, key string, config *packet.Config) (string, error) {
 	if key == "" {
 		return "", ErrEmptyKey
 	}
@@ -108,17 +283,40 @@ func Encrypt(r io.Reader, key string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not create armor encoder: %w", err)
 	}
-	w, err := openpgp.SymmetricallyEncrypt(a, []byte(key), hints, pgpConfig)
+	w, err := openpgp.SymmetricallyEncrypt(a, []byte(key), hints, config)
 	if err != nil {
 		return "", fmt.Errorf("could not encrypt: %w", err)
 	}
 	if _, err := io.Copy(w, r); err != nil {
 		return "", fmt.Errorf("could not copy data: %w", err)
 	}
-	w.Close()
-	a.Close()
+	if err := w.Close(); err != nil {
+		return "", fmt.Errorf("could not close writer: %w", err)
+	}
+	if err := a.Close(); err != nil {
+		return "", fmt.Errorf("could not close armor: %w", err)
+	}
 
 	return buf.String(), nil
+}
+
+// GenerateID creates a new secret identifier from 16 cryptographically secure
+// random bytes encoded as a 22-character base62 string (~128 bits of entropy).
+func GenerateID() (string, error) {
+	const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	n := new(big.Int).SetBytes(b)
+	result := make([]byte, 22)
+	base := big.NewInt(62)
+	mod := new(big.Int)
+	for i := 21; i >= 0; i-- {
+		n.DivMod(n, base, mod)
+		result[i] = charset[mod.Int64()]
+	}
+	return string(result), nil
 }
 
 // GenerateKey creates a new encryption key from a cryptographically secure

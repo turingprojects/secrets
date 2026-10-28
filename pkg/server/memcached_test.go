@@ -1,9 +1,13 @@
 package server
 
 import (
+	"errors"
 	"os"
+	"strconv"
+	"sync"
 	"testing"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/jhaals/yopass/pkg/yopass"
 )
 
@@ -35,5 +39,263 @@ func TestMemcached(t *testing.T) {
 	_, err = m.Get(key)
 	if err == nil {
 		t.Fatal("expected error from Get() after Delete()")
+	}
+}
+
+func TestMemcachedUnits(t *testing.T) {
+	t.Run("NewMemcached creates correct instance", func(t *testing.T) {
+		m := NewMemcached("localhost:11211")
+		if m.Client == nil {
+			t.Fatal("Client should be initialized")
+		}
+	})
+}
+
+func TestMemcachedStatus(t *testing.T) {
+	memcachedURL := os.Getenv("MEMCACHED")
+	if memcachedURL == "" {
+		t.Skip("Specify MEMCACHED env variable to test memcached database")
+	}
+
+	m := NewMemcached(memcachedURL)
+
+	t.Run("Status returns correct OneTime value for existing secret", func(t *testing.T) {
+		key := "test-status-onetime"
+		secret := yopass.Secret{Message: "test message", OneTime: true, Expiration: 3600}
+
+		// Put the secret
+		err := m.Put(key, secret)
+		if err != nil {
+			t.Fatalf("error in Put(): %v", err)
+		}
+
+		// Check status
+		s, err := m.Status(key)
+		if err != nil {
+			t.Fatalf("error in Status(): %v", err)
+		}
+
+		if s.OneTime != true {
+			t.Fatalf("expected OneTime to be true, got %v", s.OneTime)
+		}
+
+		// Clean up
+		m.Delete(key)
+	})
+
+	t.Run("Status returns correct OneTime value for non-onetime secret", func(t *testing.T) {
+		key := "test-status-multi"
+		secret := yopass.Secret{Message: "test message", OneTime: false, Expiration: 3600}
+
+		// Put the secret
+		err := m.Put(key, secret)
+		if err != nil {
+			t.Fatalf("error in Put(): %v", err)
+		}
+
+		// Check status
+		s, err := m.Status(key)
+		if err != nil {
+			t.Fatalf("error in Status(): %v", err)
+		}
+
+		if s.OneTime != false {
+			t.Fatalf("expected OneTime to be false, got %v", s.OneTime)
+		}
+
+		// Clean up
+		m.Delete(key)
+	})
+
+	t.Run("Status returns error for non-existent key", func(t *testing.T) {
+		key := "non-existent-key"
+
+		// Check status for non-existent key
+		_, err := m.Status(key)
+		if err == nil {
+			t.Fatal("expected error for non-existent key")
+		}
+
+		// Missing keys use the shared database contract.
+		if !errors.Is(err, ErrKeyNotFound) {
+			t.Fatalf("expected cache miss error, got: %v", err)
+		}
+	})
+
+	t.Run("Status works after secret is deleted by Get (OneTime)", func(t *testing.T) {
+		key := "test-status-deleted"
+		secret := yopass.Secret{Message: "test message", OneTime: true, Expiration: 3600}
+
+		// Put the secret
+		err := m.Put(key, secret)
+		if err != nil {
+			t.Fatalf("error in Put(): %v", err)
+		}
+
+		// Verify status before Get
+		s, err := m.Status(key)
+		if err != nil {
+			t.Fatalf("error in Status(): %v", err)
+		}
+		if s.OneTime != true {
+			t.Fatalf("expected OneTime to be true, got %v", s.OneTime)
+		}
+
+		// Get the secret (should delete it since OneTime=true)
+		_, err = m.Get(key)
+		if err != nil {
+			t.Fatalf("error in Get(): %v", err)
+		}
+
+		// Status should now return error since secret was deleted
+		_, err = m.Status(key)
+		if err == nil {
+			t.Fatal("expected error for deleted secret")
+		}
+	})
+
+	t.Run("Status preserves secret for non-onetime access", func(t *testing.T) {
+		key := "test-status-preserved"
+		secret := yopass.Secret{Message: "test message", OneTime: false, Expiration: 3600}
+
+		// Put the secret
+		err := m.Put(key, secret)
+		if err != nil {
+			t.Fatalf("error in Put(): %v", err)
+		}
+
+		// Check status multiple times
+		for i := 0; i < 3; i++ {
+			s, err := m.Status(key)
+			if err != nil {
+				t.Fatalf("error in Status() on iteration %d: %v", i, err)
+			}
+			if s.OneTime != false {
+				t.Fatalf("expected OneTime to be false on iteration %d, got %v", i, s.OneTime)
+			}
+		}
+
+		// Clean up
+		m.Delete(key)
+	})
+
+	t.Run("Status handles malformed JSON data", func(t *testing.T) {
+		// This test directly puts malformed data to test error handling
+		memcachedClient := m.Client
+		key := "test-status-malformed"
+
+		// Put malformed JSON directly using memcache client
+		item := &memcache.Item{
+			Key:        key,
+			Value:      []byte("invalid-json"),
+			Expiration: 3600,
+		}
+		err := memcachedClient.Set(item)
+		if err != nil {
+			t.Fatalf("error setting malformed data: %v", err)
+		}
+
+		// Status should return JSON unmarshal error
+		_, err = m.Status(key)
+		if err == nil {
+			t.Fatal("expected error for malformed JSON")
+		}
+
+		// Clean up
+		m.Delete(key)
+	})
+}
+
+func TestMemcachedHealth(t *testing.T) {
+	memcachedURL := os.Getenv("MEMCACHED")
+	if memcachedURL == "" {
+		t.Skip("Specify MEMCACHED env variable to test memcached database")
+	}
+
+	m := NewMemcached(memcachedURL)
+
+	t.Run("Health returns nil when Memcached is available", func(t *testing.T) {
+		err := m.Health()
+		if err != nil {
+			t.Fatalf("expected Health() to succeed, got error: %v", err)
+		}
+	})
+
+	t.Run("Health returns error when Memcached is unavailable", func(t *testing.T) {
+		badMemcached := NewMemcached("invalid-host:9999")
+
+		err := badMemcached.Health()
+		if err == nil {
+			t.Fatal("expected Health() to fail with invalid Memcached connection")
+		}
+	})
+}
+
+func TestMemcachedUpdate(t *testing.T) {
+	memcachedURL := os.Getenv("MEMCACHED")
+	if memcachedURL == "" {
+		t.Skip("Specify MEMCACHED env variable to test memcached database")
+	}
+
+	m := NewMemcached(memcachedURL)
+
+	key := "update-test-" + t.Name()
+	defer func() { _, _ = m.Delete(key) }()
+
+	// Update of a missing key reports ErrKeyNotFound
+	if err := m.Update(key, func(s yopass.Secret) (yopass.Secret, error) {
+		return s, nil
+	}); err != ErrKeyNotFound {
+		t.Fatalf("expected ErrKeyNotFound, got %v", err)
+	}
+
+	if err := m.Put(key, yopass.Secret{Message: "0", Expiration: 3600}); err != nil {
+		t.Fatalf("error in Put(): %v", err)
+	}
+
+	// An error returned by fn aborts the update without writing
+	abort := errors.New("abort")
+	if err := m.Update(key, func(s yopass.Secret) (yopass.Secret, error) {
+		s.Message = "must not be stored"
+		return s, abort
+	}); err != abort {
+		t.Fatalf("expected abort error, got %v", err)
+	}
+	if s, err := m.Status(key); err != nil || s.Message != "0" {
+		t.Fatalf("aborted update must not write: %v %v", s, err)
+	}
+
+	// Concurrent increments must all land exactly once
+	const writers = 10
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				err := m.Update(key, func(s yopass.Secret) (yopass.Secret, error) {
+					n, err := strconv.Atoi(s.Message)
+					if err != nil {
+						return s, err
+					}
+					s.Message = strconv.Itoa(n + 1)
+					return s, nil
+				})
+				if err == nil {
+					return
+				}
+				// Retries are bounded per Update call; loop until this
+				// writer's increment lands.
+			}
+		}()
+	}
+	wg.Wait()
+
+	s, err := m.Status(key)
+	if err != nil {
+		t.Fatalf("error in Status(): %v", err)
+	}
+	if s.Message != strconv.Itoa(writers) {
+		t.Fatalf("lost updates: expected %d, got %s", writers, s.Message)
 	}
 }
